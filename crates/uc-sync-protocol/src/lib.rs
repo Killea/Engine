@@ -10,6 +10,7 @@ pub mod active_clipboard_state;
 pub mod clipboard;
 pub mod full_invitation;
 pub mod membership_branch_recovery;
+pub mod remote_share;
 pub mod space_admission;
 pub mod trace_context;
 pub mod transfer_progress;
