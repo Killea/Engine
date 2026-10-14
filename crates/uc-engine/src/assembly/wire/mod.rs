@@ -26,8 +26,8 @@ use uc_application::deps::{
     ConfigMigrationDeps, CurrentSpaceIdentityPort, DevicePorts, DirectoryReceivePorts,
     FileTransferPorts, InitialSpaceActivationPort, PortableCurrentSpaceIdentityPort,
     ProfileLifecycle, ProfileLifecycleRepositoryPort, ProfileLifecycleState,
-    RePairingStateStorePort, RetireUpgradeBackupSecurityRecordsPort, SearchPorts, SecurityPorts,
-    SpaceAccessPorts, SpaceRebuildProgressPort, StoragePorts, SystemPorts,
+    RePairingStateStorePort, RemoteSharePorts, RetireUpgradeBackupSecurityRecordsPort, SearchPorts,
+    SecurityPorts, SpaceAccessPorts, SpaceRebuildProgressPort, StoragePorts, SystemPorts,
 };
 use uc_application::facade::HostEventEmitterPort;
 use uc_core::app_dirs::AppPaths;
@@ -35,6 +35,7 @@ use uc_core::clipboard::SelectRepresentationPolicyV1;
 use uc_core::ids::{ProfileId, RepresentationId};
 use uc_core::ports::blob::BlobReferenceRepositoryPort;
 use uc_core::ports::clipboard::{RepresentationCachePort, SelfWriteLedgerPort, SpoolQueuePort};
+use uc_core::ports::remote_share::SharedRootStorePort;
 use uc_core::ports::*;
 use uc_infra_content::clipboard::{
     new_in_memory_change_origin, ClipboardPayloadResolver, DurableSpoolQueue,
@@ -42,7 +43,7 @@ use uc_infra_content::clipboard::{
 };
 use uc_infra_content::config::ClipboardStorageConfig;
 use uc_infra_local::blob::BlobRepositoryPort;
-use uc_infra_local::fs::VaultLayout;
+use uc_infra_local::fs::{CapStdConfinement, VaultLayout};
 use uc_infra_local::settings::repository::FileSettingsRepository;
 use uc_infra_local::{FileAppVersionStateRepository, FileFirstSyncStateRepository, SystemClock};
 use uc_infra_p2p::network::iroh::IrohIdentityStore;
@@ -82,6 +83,7 @@ use uc_infra_storage::db::repositories::{
     DieselReceiveArtifactLogRepository, DieselSpaceMemberRepository, DieselSpaceSecurityStore,
     DieselThumbnailRepository, DieselTrustedPeerRepository, EncryptedRelationshipStore,
 };
+use uc_infra_storage::remote_share::EncryptedShareStore;
 use uc_infra_storage::search::{
     HkdfSearchKeyDerivation, SearchPipeline, SqliteSearchIndex, V3SearchKeyDerivation,
 };
@@ -469,6 +471,7 @@ pub async fn wire_dependencies_from_inputs(
             &platform.session,
             &infra.control_db_executor,
             &profile_content_key_vault,
+            VaultLayout::new(vault_path.clone()).share_store_path(),
         );
     let profile_key_access_probe = space_access_adapter.clone();
     let membership_session = Arc::clone(&platform.session);
@@ -979,6 +982,11 @@ pub async fn wire_dependencies_from_inputs(
         device: DevicePorts {
             device_identity: platform.device_identity,
             member_repo: Arc::clone(&member_repo),
+        },
+        // 根目录的注册属于"用户显式添加共享根"动作（P5 daemon 路由驱动），装配层只建
+        // 空表，绝不在启动时打开任何用户目录。
+        remote_share: RemoteSharePorts {
+            confinement: Arc::new(CapStdConfinement::new()),
         },
         space_rebuild_progress: infra.space_rebuild_progress,
         current_space_identity,

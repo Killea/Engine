@@ -42,6 +42,7 @@ pub(super) fn build_space_access_ports(
     session: &Arc<InMemorySession>,
     db_executor: &Arc<DieselSqliteExecutor>,
     profile_content_key_vault: &Arc<ProfileContentKeyVault>,
+    share_store_path: std::path::PathBuf,
 ) -> (
     SpaceAccessPorts,
     Arc<uc_infra_profile::space::RuntimeSpaceAccessAdapter>,
@@ -74,6 +75,13 @@ pub(super) fn build_space_access_ports(
     let rebind = Arc::new(uc_infra_profile::space::SpaceSessionRebindAdapter::new(
         Arc::clone(session),
     ));
+    // 共享根清单的密文存储：密封子密钥走本函数唯一的那个 Space 访问适配器，
+    // 与其余 `derive_subkey` 消费者（关系存储、搜索根密钥）同源，不另起一份密钥。
+    // 该字段必须在下面的字面量里一次给出，因此构造点只能落在这里而不是调用方。
+    let share_store: Arc<dyn SharedRootStorePort> = Arc::new(EncryptedShareStore::new(
+        space_access_adapter.clone(),
+        share_store_path,
+    ));
     let space_access_ports = SpaceAccessPorts {
         adopt_isolated_space: rebind,
         initialize: space_access_adapter.clone(),
@@ -91,6 +99,7 @@ pub(super) fn build_space_access_ports(
         group_revocation: space_access_adapter.clone(),
         group_bootstrap: space_access_adapter.clone(),
         space_protection: space_access_adapter.clone(),
+        share_store,
     };
     (
         space_access_ports,

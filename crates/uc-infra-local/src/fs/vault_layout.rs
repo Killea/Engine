@@ -4,6 +4,7 @@ const LEGACY_REBUILD_TARGET_FILE: &str = ".setup_status..legacy_isolation_target
 const RE_PAIRING_STATE_FILE: &str = ".re-pairing-state-v1";
 const LEGACY_CURRENT_SPACE_ID_FILE: &str = ".current-space-id-v1";
 const ENGINE_UPGRADE_CURSOR_FILE: &str = ".engine-upgrade-cursor.json";
+const SHARE_STORE_FILE: &str = "share-store-v1.json";
 
 #[derive(Debug, Clone)]
 pub struct VaultLayout {
@@ -29,6 +30,12 @@ impl VaultLayout {
 
     pub fn engine_upgrade_cursor_path(&self) -> PathBuf {
         self.root.join(ENGINE_UPGRADE_CURSOR_FILE)
+    }
+
+    /// 共享根清单的密文文档位置（规格 §5.1）。文件名只有一个来源，装配层与实现
+    /// 都从这里取值，避免两处各写一份字面量。
+    pub fn share_store_path(&self) -> PathBuf {
+        self.root.join(SHARE_STORE_FILE)
     }
 
     pub fn root(&self) -> &Path {
@@ -57,5 +64,6 @@ mod tests {
             layout.legacy_current_space_id_path(),
             root.join(".current-space-id-v1")
         );
+        assert_eq!(layout.share_store_path(), root.join("share-store-v1.json"));
     }
 }

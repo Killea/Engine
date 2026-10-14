@@ -20,6 +20,7 @@ use uc_core::ports::clipboard::{
     SystemClipboardPort, ThumbnailGeneratorPort, ThumbnailRepositoryPort, TouchClipboardEntryPort,
     UpdateRepresentationProcessingResultPort,
 };
+use uc_core::ports::remote_share::{ShareConfinementPort, SharedRootStorePort};
 use uc_core::ports::search::maintenance::SearchIndexMaintenancePort;
 use uc_core::ports::search::search_index::SearchIndexPort;
 use uc_core::ports::search::search_key::SearchKeyDerivationPort;
@@ -306,6 +307,11 @@ pub struct SpaceAccessPorts {
     pub group_bootstrap: Arc<dyn uc_core::membership::GroupBootstrapPort>,
     /// 查询 Space 成员集合的当前保护状态。
     pub space_protection: Arc<dyn uc_core::membership::SpaceProtectionStatusPort>,
+    /// 共享根清单的密文存储；未解锁时不可读。
+    ///
+    /// 与 `derive_subkey` 同源：清单的密封密钥由本集合里那个唯一的子密钥派生端口
+    /// 产出，因此 Space 锁定即清单不可读也不可写（规格 §5.1）。
+    pub share_store: Arc<dyn SharedRootStorePort>,
 }
 
 /// 安全领域端口组。
@@ -323,6 +329,21 @@ pub struct SecurityPorts {
     pub transfer_cipher: Arc<dyn uc_core::ports::security::TransferCipherPort>,
     /// 为配对流程生成身份指纹的工厂端口。
     pub fingerprint: Arc<dyn uc_core::ports::security::IdentityFingerprintFactoryPort>,
+}
+
+/// 设备文件共享里不依赖 Space 会话的端口组。
+///
+/// 路径约束内核只操作自己注册的根句柄：它既不读 Space 会话，也不派生任何子密钥，
+/// 因此不进 `SpaceAccessPorts`。那一组的成立前提是"同一个 Space 访问适配器投影"，
+/// 混进去会让分组退化成 catch-all，并把一个无密钥依赖的能力锁死在 security/space
+/// 路径上。`share_store` 反过来留在 `SpaceAccessPorts`：它的密封密钥确实来自子密钥派生。
+#[derive(Clone)]
+pub struct RemoteSharePorts {
+    /// 共享根的路径约束内核。
+    ///
+    /// 装配层只给出空表；根目录的注册与撤销由"用户显式添加共享根"的动作驱动，
+    /// 不在组合根里打开任何用户目录。
+    pub confinement: Arc<dyn ShareConfinementPort>,
 }
 
 /// 设备领域端口组，包含配对所需能力。
@@ -526,6 +547,8 @@ pub struct ApplicationDeps {
     pub security: SecurityPorts,
     /// 设备与配对领域端口。
     pub device: DevicePorts,
+    /// 设备文件共享里与 Space 会话无关的端口。
+    pub remote_share: RemoteSharePorts,
     /// 持久化并恢复当前未完成 Space 重建目标的端口。
     pub space_rebuild_progress: Arc<dyn SpaceRebuildProgressPort>,
     /// 读取当前 Space 身份及旧 profile 隔离需求的端口。

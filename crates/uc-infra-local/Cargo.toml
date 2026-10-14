@@ -27,6 +27,12 @@ hex = "0.4.3"
 blake3 = "1.8.2"
 tracing = "0.1"
 
+# Device file-share path-confinement primitive (ADR-034): capability-style directory
+# handles so every share-root operation starts from an open directory fd. Containment
+# strength is pinned by crates/uc-infra-local/tests/share_confinement_escape_probe.rs
+# and is cross-platform (Linux/macOS/Windows) without per-platform syscall bindings.
+cap-std = "4.0.3"
+
 # ===== Blob/profile ciphertext ports consumed by migration_state only =====
 uc-observability-contract = { path = "../uc-observability-contract" }
 uuid = { version = "1.10.0", features = ["v4"] }

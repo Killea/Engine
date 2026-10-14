@@ -45,6 +45,7 @@ pub mod pairing_invitation;
 pub mod peer_address;
 pub mod peer_reachability;
 pub mod receive_artifact_log;
+pub mod remote_share;
 pub mod search;
 pub mod security;
 pub mod settings;

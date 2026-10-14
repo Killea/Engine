@@ -17,6 +17,7 @@ pub mod config_migration;
 pub mod diagnostics;
 pub mod file_transfer;
 pub mod host_event;
+pub mod remote_share;
 pub mod roster;
 pub mod search;
 pub mod settings;
@@ -175,3 +176,4 @@ pub use storage::{ClearCacheResultView, StorageFacade, StorageFacadeError, Stora
 pub use upgrade::{AcknowledgeUpgradeError, DetectUpgradeError, UpgradeFacade, UpgradeStatus};
 
 pub use crate::space::{ConnectivityOpportunity, PeerConnectionError};
+pub use remote_share::{RemoteShareFacade, RemoteShareFacadeDeps, SharePermit};

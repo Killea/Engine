@@ -13,6 +13,9 @@ pub(crate) mod runtime_lifecycle;
 
 pub(crate) mod clipboard;
 pub(crate) mod device;
+// ADR-018：crate 根只公开 `facade` 与 `deps`，本模块保持 `pub(crate)`；对外入口经
+// `facade::remote_share::RemoteShareFacade` 暴露（facade 消费 `ShareAuthorizer`）。
+pub(crate) mod remote_share;
 pub(crate) mod search;
 pub(crate) mod settings;
 pub(crate) mod space;
