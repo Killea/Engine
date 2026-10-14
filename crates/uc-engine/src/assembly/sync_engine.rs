@@ -27,12 +27,15 @@ use uc_application::deps::{
     PeerIdentityDirectoryPort, SpaceAdmissionAdapters, SpaceMembershipAdapters,
     SpaceRuntimeAdapters,
 };
-use uc_application::facade::ApplicationAssembly;
+use uc_application::facade::{
+    remote_share::{RemoteShareServe, RemoteShareServeDeps},
+    ApplicationAssembly,
+};
 use uc_core::file_transfer::FileTransferCancellationReason;
 use uc_core::membership::{ContentExchangeGatePort, PeerAdmissionPort};
 use uc_core::ports::{
-    ActiveClipboardDispatchPort, ActiveClipboardReceiverPort, ClipboardDispatchPort,
-    ConnectionChannelPort, LocalIdentityPort, PeerReachabilityPort,
+    remote_share::RemoteShareServePort, ActiveClipboardDispatchPort, ActiveClipboardReceiverPort,
+    ClipboardDispatchPort, ConnectionChannelPort, LocalIdentityPort, PeerReachabilityPort,
 };
 use uc_infra_local::fs::{
     FsAtomicPublisher, FsDirectoryStagingCleaner, FsHiddenPathMarker, FsInboundFileTarget,
@@ -529,6 +532,20 @@ pub async fn prepare_sync_session(
         Arc::clone(&space_setup.fingerprint),
         application_network.active_clipboard_pull_serve(),
         content_gate,
+    )?;
+
+    // Install the remote-share/1 control-plane ALPN (device file sharing,
+    // metadata-only: Hello/ListRoots/List/Stat). The serve port enforces the
+    // authorize→confine→read AND (fail-closed) per request; bulk bytes arrive
+    // later over the transfer pipeline, never this channel.
+    builder.install_remote_share(
+        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
+        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
+        Arc::clone(&space_setup.fingerprint),
+        Arc::new(RemoteShareServe::new(RemoteShareServeDeps {
+            share_store: Arc::clone(&space_setup.space_access.share_store),
+            confinement: Arc::clone(&space_setup.remote_share.confinement),
+        })) as Arc<dyn RemoteShareServePort>,
     )?;
 
     let prepared_session = builder.finish();

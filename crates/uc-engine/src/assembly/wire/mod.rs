@@ -1030,6 +1030,7 @@ pub async fn wire_dependencies_from_inputs(
     let sync_fingerprint = Arc::clone(&deps.security.fingerprint);
     let sync_clock = Arc::clone(&deps.system.clock);
     let sync_space_access = deps.security.space_access_ports.clone();
+    let sync_remote_share = deps.remote_share.clone();
     #[cfg(test)]
     let sync_analytics = Arc::clone(&deps.analytics);
     #[cfg(feature = "lan-compat")]
@@ -1058,6 +1059,7 @@ pub async fn wire_dependencies_from_inputs(
             fingerprint: sync_fingerprint,
             clock: sync_clock,
             space_access: sync_space_access,
+            remote_share: sync_remote_share,
             #[cfg(test)]
             analytics: sync_analytics,
             iroh_identity_storage,

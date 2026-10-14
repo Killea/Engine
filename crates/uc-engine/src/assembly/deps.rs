@@ -77,6 +77,11 @@ pub struct SyncEngineDeps {
     pub fingerprint: Arc<dyn uc_core::ports::security::IdentityFingerprintFactoryPort>,
     pub clock: Arc<dyn uc_core::ports::ClockPort>,
     pub space_access: uc_application::deps::SpaceAccessPorts,
+    /// 设备文件共享控制面的路径约束内核（P2 `remote-share/1` ALPN）。
+    ///
+    /// 与 `space_access` 并列：两者的 `share_store`（AEAD 白名单）已随
+    /// `SpaceAccessPorts` 投影，这里只补约束内核，供会话装配时构造 serve 端口。
+    pub remote_share: uc_application::deps::RemoteSharePorts,
     #[cfg(test)]
     pub analytics: Arc<dyn uc_observability_contract::analytics::AnalyticsPort>,
     /// Dedicated file-backed storage for the long-lived iroh network identity.

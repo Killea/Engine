@@ -30,6 +30,7 @@ mod peer_reachability_protocol;
 pub mod persistable_addr;
 mod protocol_router;
 pub mod relay_probe;
+pub mod remote_share;
 pub(crate) mod runtime_consts;
 mod session_generation;
 pub mod space_admission;
@@ -83,6 +84,9 @@ pub use peer_reachability_adapter::{
 pub use relay_probe::{
     IrohRelayProbeAdapter, RelayProbeError as IrohRelayProbeError,
     RelayProbeReport as IrohRelayProbeReport,
+};
+pub use remote_share::{
+    IrohRemoteShareServeAdapter, IrohRemoteShareServeHandler, REMOTE_SHARE_ALPN,
 };
 pub use space_admission::{
     encode_space_admission_route, IrohSpaceAdmissionHandler, IrohSpaceAdmissionTransport,

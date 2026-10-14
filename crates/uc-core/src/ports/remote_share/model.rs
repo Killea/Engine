@@ -9,6 +9,21 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShareRootId(pub Uuid);
 
+impl ShareRootId {
+    /// The 16 raw bytes for the wire form. Opaque to the peer: it is the holder's
+    /// share-root id, not a UUID-shaped value the client is expected to interpret.
+    #[must_use]
+    pub fn as_bytes(self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
+
+    /// Construct from the 16 raw wire bytes.
+    #[must_use]
+    pub fn from_wire_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
 /// 逐根权限（规格 §5.1）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareGrants {
