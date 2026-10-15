@@ -31,6 +31,9 @@ pub struct ShareRootsRegistry {
     /// 本责任人登记过的根 id；登记表不给列举 API，撤销谁只能靠这份自记集合。
     /// `std::sync::Mutex` 足矣：持锁区间全是同步集合读写，从不跨 `.await`。
     registered: Mutex<HashSet<ShareRootId>>,
+    /// 清单写路径的串行闸：load→save→收敛必须对其它写者整体互斥，否则
+    /// 并发 PUT/suspend 会交错丢更新（读-改-写竞态）。
+    doc_write: tokio::sync::Mutex<()>,
 }
 
 /// 一次收敛的稳定结果（供装配层记录/判定，不携带任何路径或根标识明细）。
@@ -53,6 +56,7 @@ impl ShareRootsRegistry {
             share_store,
             confinement,
             registered: Mutex::new(HashSet::new()),
+            doc_write: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -85,14 +89,34 @@ impl ShareRootsRegistry {
         );
     }
 
+    /// 清单读路径：本机共享管理面（`GET /remote-share/state`）的取数口。
+    /// 文档归本责任人管，读取同样只走这里——登记表不对外列根。
+    pub async fn current_doc(&self) -> Result<ShareStoreDoc, SharedRootStoreError> {
+        self.share_store.load().await
+    }
+
     /// 清单写路径：先持久化，落盘成功才按新清单收敛；save 失败原样上抛，
     /// 登记表保持与旧清单一致——两半状态机不允许各走各的。
     pub async fn replace_doc(
         &self,
         doc: &ShareStoreDoc,
     ) -> Result<ReconcileReport, SharedRootStoreError> {
+        let _write = self.doc_write.lock().await;
         self.share_store.save(doc).await?;
         Ok(self.reconcile_doc(doc).await)
+    }
+
+    /// 读-改-写清单：写锁内 load→mutate→save→收敛。并发写者串行化，
+    /// 不丢更新；`mutate` 只作用于内存文档，save 失败时登记表保持旧态。
+    pub async fn update_doc(
+        &self,
+        mutate: impl FnOnce(&mut ShareStoreDoc),
+    ) -> Result<ReconcileReport, SharedRootStoreError> {
+        let _write = self.doc_write.lock().await;
+        let mut doc = self.share_store.load().await?;
+        mutate(&mut doc);
+        self.share_store.save(&doc).await?;
+        Ok(self.reconcile_doc(&doc).await)
     }
 
     /// 按一份已取出的清单收敛登记表：启用根登记、其余撤销；`suspended` 时

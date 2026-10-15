@@ -15,6 +15,8 @@ pub enum EngineErrorCategory {
     Unavailable,
     DeadlineExceeded,
     Internal,
+    /// 调用方主动取消了该操作（spec §9.1：remote-share 传输取消）。
+    Cancelled,
 }
 
 impl fmt::Display for EngineErrorCategory {
@@ -28,6 +30,7 @@ impl fmt::Display for EngineErrorCategory {
             Self::Unavailable => "unavailable",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Internal => "internal",
+            Self::Cancelled => "cancelled",
         };
         formatter.write_str(value)
     }

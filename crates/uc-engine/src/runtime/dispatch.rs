@@ -20,6 +20,13 @@ use crate::operations::device::member::{
 use crate::operations::device::peer_connections::{
     execute_query_peer_connections, execute_refresh_peer_connections,
 };
+use crate::operations::device::remote_share::{
+    execute_cancel_peer_share_transfer, execute_download_peer_share,
+    execute_list_peer_share_directory, execute_list_peer_share_roots,
+    execute_list_peer_share_trash, execute_mutate_peer_share, execute_query_peer_share_state,
+    execute_query_remote_share_state, execute_replace_remote_share_roots,
+    execute_set_remote_share_suspended, execute_stat_peer_share_entry, execute_upload_peer_share,
+};
 use crate::operations::history::delivery::execute_query_entry_delivery;
 use crate::operations::history::history::{
     execute_clear_history, execute_delete_history_entry, execute_get_history_entry,
@@ -599,6 +606,116 @@ impl EngineRuntime for ProductionRuntime {
                     execute_resend_entry(self.current_facade().await?.as_ref(), input).await
                 }
                 Operation::ExportEntry(input) => self.execute_export_entry(input).await,
+                // remote-share（spec §9.1）：全部 session-scoped——会话未建
+                // 时句柄访问器即返回 `unavailable`，daemon 译为 session_locked。
+                Operation::QueryRemoteShareState => {
+                    execute_query_remote_share_state(
+                        self.session_supervisor
+                            .current_remote_share_registry()
+                            .await?,
+                    )
+                    .await
+                }
+                Operation::ReplaceRemoteShareRoots(input) => {
+                    execute_replace_remote_share_roots(
+                        self.session_supervisor
+                            .current_remote_share_registry()
+                            .await?,
+                        input,
+                        self.clock.now_ms(),
+                    )
+                    .await
+                }
+                Operation::SetRemoteShareSuspended(input) => {
+                    execute_set_remote_share_suspended(
+                        self.session_supervisor
+                            .current_remote_share_registry()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::QueryPeerShareState(input) => {
+                    execute_query_peer_share_state(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::ListPeerShareRoots(input) => {
+                    execute_list_peer_share_roots(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::ListPeerShareDirectory(input) => {
+                    execute_list_peer_share_directory(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::StatPeerShareEntry(input) => {
+                    execute_stat_peer_share_entry(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::ListPeerShareTrash(input) => {
+                    execute_list_peer_share_trash(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::MutatePeerShare(input) => {
+                    execute_mutate_peer_share(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::UploadPeerShare(input) => {
+                    execute_upload_peer_share(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::DownloadPeerShare(input) => {
+                    execute_download_peer_share(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
+                Operation::CancelPeerShareTransfer(input) => {
+                    execute_cancel_peer_share_transfer(
+                        self.session_supervisor
+                            .current_remote_share_client()
+                            .await?,
+                        input,
+                    )
+                    .await
+                }
             }
         };
         let result = if matches!(operation_kind, crate::OperationKind::ResetSpace) {

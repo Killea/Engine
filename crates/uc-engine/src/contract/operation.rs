@@ -13,6 +13,11 @@ use crate::{
     RevalidateMobileCredentialInput, SaveRelayInput, SettingsPatch, StageConfigImportInput,
     UpdateDebugModeInput, UpdateMobileDeviceInput,
 };
+use crate::{
+    CancelPeerShareTransferInput, DownloadPeerShareInput, MutatePeerShareInput, PeerShareListInput,
+    PeerShareRelInput, PeerShareRequest, PeerShareTrashListInput, ReplaceRemoteShareRootsInput,
+    SetRemoteShareSuspendedInput, UploadPeerShareInput,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,6 +139,20 @@ pub enum OperationKind {
     RestoreClipboard,
     ExportEntry,
     ResendEntry,
+    // remote-share（设备文件共享，spec §9.1）：session-scoped，未解锁一律
+    // `unavailable`。
+    QueryRemoteShareState,
+    ReplaceRemoteShareRoots,
+    SetRemoteShareSuspended,
+    QueryPeerShareState,
+    ListPeerShareRoots,
+    ListPeerShareDirectory,
+    StatPeerShareEntry,
+    ListPeerShareTrash,
+    MutatePeerShare,
+    UploadPeerShare,
+    DownloadPeerShare,
+    CancelPeerShareTransfer,
 }
 
 impl fmt::Display for OperationKind {
@@ -248,6 +267,18 @@ impl fmt::Display for OperationKind {
             Self::RestoreClipboard => "restore_clipboard",
             Self::ExportEntry => "export_entry",
             Self::ResendEntry => "resend_entry",
+            Self::QueryRemoteShareState => "query_remote_share_state",
+            Self::ReplaceRemoteShareRoots => "replace_remote_share_roots",
+            Self::SetRemoteShareSuspended => "set_remote_share_suspended",
+            Self::QueryPeerShareState => "query_peer_share_state",
+            Self::ListPeerShareRoots => "list_peer_share_roots",
+            Self::ListPeerShareDirectory => "list_peer_share_directory",
+            Self::StatPeerShareEntry => "stat_peer_share_entry",
+            Self::ListPeerShareTrash => "list_peer_share_trash",
+            Self::MutatePeerShare => "mutate_peer_share",
+            Self::UploadPeerShare => "upload_peer_share",
+            Self::DownloadPeerShare => "download_peer_share",
+            Self::CancelPeerShareTransfer => "cancel_peer_share_transfer",
         };
         formatter.write_str(value)
     }
@@ -406,6 +437,18 @@ pub enum Operation {
     RestoreClipboard(RestoreClipboardInput),
     ExportEntry(ExportEntryInput),
     ResendEntry(ResendEntryInput),
+    QueryRemoteShareState,
+    ReplaceRemoteShareRoots(ReplaceRemoteShareRootsInput),
+    SetRemoteShareSuspended(SetRemoteShareSuspendedInput),
+    QueryPeerShareState(PeerShareRequest),
+    ListPeerShareRoots(PeerShareRequest),
+    ListPeerShareDirectory(PeerShareListInput),
+    StatPeerShareEntry(PeerShareRelInput),
+    ListPeerShareTrash(PeerShareTrashListInput),
+    MutatePeerShare(MutatePeerShareInput),
+    UploadPeerShare(UploadPeerShareInput),
+    DownloadPeerShare(DownloadPeerShareInput),
+    CancelPeerShareTransfer(CancelPeerShareTransferInput),
 }
 
 impl Operation {
@@ -522,6 +565,18 @@ impl Operation {
             Self::RestoreClipboard(_) => OperationKind::RestoreClipboard,
             Self::ExportEntry(_) => OperationKind::ExportEntry,
             Self::ResendEntry(_) => OperationKind::ResendEntry,
+            Self::QueryRemoteShareState => OperationKind::QueryRemoteShareState,
+            Self::ReplaceRemoteShareRoots(_) => OperationKind::ReplaceRemoteShareRoots,
+            Self::SetRemoteShareSuspended(_) => OperationKind::SetRemoteShareSuspended,
+            Self::QueryPeerShareState(_) => OperationKind::QueryPeerShareState,
+            Self::ListPeerShareRoots(_) => OperationKind::ListPeerShareRoots,
+            Self::ListPeerShareDirectory(_) => OperationKind::ListPeerShareDirectory,
+            Self::StatPeerShareEntry(_) => OperationKind::StatPeerShareEntry,
+            Self::ListPeerShareTrash(_) => OperationKind::ListPeerShareTrash,
+            Self::MutatePeerShare(_) => OperationKind::MutatePeerShare,
+            Self::UploadPeerShare(_) => OperationKind::UploadPeerShare,
+            Self::DownloadPeerShare(_) => OperationKind::DownloadPeerShare,
+            Self::CancelPeerShareTransfer(_) => OperationKind::CancelPeerShareTransfer,
         }
     }
 }

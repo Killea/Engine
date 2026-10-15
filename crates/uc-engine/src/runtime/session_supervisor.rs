@@ -13,6 +13,7 @@ use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uc_application::deps::LifecycleError;
+use uc_application::facade::remote_share::{RemoteShareClient, ShareRootsRegistry};
 use uc_application::facade::{
     AppFacade, ApplicationAssembly, ApplicationRuntime, ClipboardInboundEvent,
     ClipboardInboundEventAction, ClipboardInboundEventPort, CompletePendingSpaceTransitionError,
@@ -340,6 +341,8 @@ fn observe_session_request(
                 EngineErrorCategory::Unavailable => SessionFailure::Unavailable,
                 EngineErrorCategory::DeadlineExceeded => SessionFailure::DeadlineExceeded,
                 EngineErrorCategory::Internal => SessionFailure::Internal,
+                // 会话生命周期操作不产出 Cancelled；兜底归入 Internal。
+                EngineErrorCategory::Cancelled => SessionFailure::Internal,
             }),
         };
         observation.finish(completion);
@@ -359,6 +362,8 @@ fn session_lifecycle_error_type(error: &EngineError) -> DiagnosticErrorType {
             DiagnosticErrorType::Corrupt
         }
         crate::EngineErrorCategory::Internal => DiagnosticErrorType::Internal,
+        // 会话生命周期路径不会出现取消类错误；归类 Internal 兜底。
+        EngineErrorCategory::Cancelled => DiagnosticErrorType::Internal,
     }
 }
 
@@ -482,6 +487,33 @@ impl SessionSupervisor {
             .session
             .as_ref()
             .map(|session| Arc::clone(&session.mobile_sync))
+            .ok_or_else(operation_unavailable_error)
+    }
+
+    /// remote-share 出站流程负责人的会话句柄（spec §9.1：ops 经句柄访问器
+    /// 取会话装配，不经 AppFacade 子门面）。
+    pub(super) async fn current_remote_share_client(
+        &self,
+    ) -> Result<Arc<RemoteShareClient>, EngineError> {
+        self.runtime
+            .lock()
+            .await
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.sync_session.remote_share_client))
+            .ok_or_else(operation_unavailable_error)
+    }
+
+    /// 本机共享清单 ↔ 约束登记表的收敛责任人句柄（本机共享管理 op 用）。
+    pub(super) async fn current_remote_share_registry(
+        &self,
+    ) -> Result<Arc<ShareRootsRegistry>, EngineError> {
+        self.runtime
+            .lock()
+            .await
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.sync_session.remote_share_registry))
             .ok_or_else(operation_unavailable_error)
     }
 

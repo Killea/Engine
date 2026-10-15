@@ -64,6 +64,32 @@ pub enum ShareClientDeny {
     Interrupted,
 }
 
+impl ShareClientDeny {
+    /// §12 稳定字符串码——daemon/前端错误通道的词表，与 wire `DenyCode`
+    /// 的编码一一对应。
+    pub const fn stable_code(&self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Unsupported => "unsupported",
+            Self::UnsupportedRequest => "unsupported_request",
+            Self::Suspended => "suspended",
+            Self::Revoked => "revoked",
+            Self::Denied => "denied",
+            Self::ReservedName => "reserved_name",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::RootGone => "root_gone",
+            Self::Quota => "quota",
+            Self::TooLarge => "too_large",
+            Self::TooManyEntries => "too_many_entries",
+            Self::Io => "io",
+            Self::Cancelled => "cancelled",
+            Self::TooLate => "too_late",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// Client 侧一次远端共享请求的失败分类。
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteShareClientError {

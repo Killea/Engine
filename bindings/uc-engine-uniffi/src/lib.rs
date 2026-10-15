@@ -29,6 +29,8 @@ pub enum BindingErrorCategory {
     Unavailable,
     DeadlineExceeded,
     Internal,
+    /// 调用方主动取消（spec §9.1 remote-share 传输取消）。
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
@@ -93,6 +95,7 @@ fn map_error_category(category: uc_engine::EngineErrorCategory) -> BindingErrorC
         uc_engine::EngineErrorCategory::Unavailable => BindingErrorCategory::Unavailable,
         uc_engine::EngineErrorCategory::DeadlineExceeded => BindingErrorCategory::DeadlineExceeded,
         uc_engine::EngineErrorCategory::Internal => BindingErrorCategory::Internal,
+        uc_engine::EngineErrorCategory::Cancelled => BindingErrorCategory::Cancelled,
     }
 }
 

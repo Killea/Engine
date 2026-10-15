@@ -62,6 +62,8 @@ fn invitation_issue_error_category(category: EngineErrorCategory) -> InvitationI
         EngineErrorCategory::Unavailable => InvitationIssueErrorCategory::Unavailable,
         EngineErrorCategory::DeadlineExceeded => InvitationIssueErrorCategory::DeadlineExceeded,
         EngineErrorCategory::Internal => InvitationIssueErrorCategory::Internal,
+        // 邀请签发不会产生取消类错误；封闭枚举要求覆盖，归入 Internal。
+        EngineErrorCategory::Cancelled => InvitationIssueErrorCategory::Internal,
     }
 }
 

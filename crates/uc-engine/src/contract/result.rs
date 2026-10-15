@@ -18,6 +18,12 @@ use crate::{
     RelayCredentialStatus, RelayOverview, RelayProbeOutcome, SaveRelayOutcome, SettingsSummary,
     SettingsUpdateOutcome, UpgradeStatusSummary,
 };
+use crate::{
+    PeerShareDirectoryPage, PeerShareDownloadSummary, PeerShareEntrySummary,
+    PeerShareMutationOutcome, PeerShareRootSummary, PeerShareState, PeerShareTransferCancelOutcome,
+    PeerShareTrashPage, PeerShareUploadSummary, RemoteShareReconcileSummary,
+    RemoteShareStateSummary,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -625,6 +631,18 @@ pub enum OperationResult {
     ClipboardRestored(ClipboardRestoreOutcome),
     EntryExported,
     EntryResent(ResendEntryOutcome),
+    // remote-share（设备文件共享，spec §9.1）
+    RemoteShareState(RemoteShareStateSummary),
+    RemoteShareReconciled(RemoteShareReconcileSummary),
+    PeerShareState(PeerShareState),
+    PeerShareRoots(Vec<PeerShareRootSummary>),
+    PeerShareDirectory(PeerShareDirectoryPage),
+    PeerShareEntry(PeerShareEntrySummary),
+    PeerShareTrash(PeerShareTrashPage),
+    PeerShareMutated(PeerShareMutationOutcome),
+    PeerShareUploaded(PeerShareUploadSummary),
+    PeerShareDownloaded(PeerShareDownloadSummary),
+    PeerShareTransferCancellation(PeerShareTransferCancelOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -997,6 +1015,39 @@ impl fmt::Debug for OperationResult {
             Self::EntryExported => debug.field("kind", &"entry_exported"),
             Self::EntryResent(outcome) => debug
                 .field("kind", &"entry_resent")
+                .field("outcome", outcome),
+            Self::RemoteShareState(state) => debug
+                .field("kind", &"remote_share_state")
+                .field("suspended", &state.suspended)
+                .field("root_count", &state.roots.len()),
+            Self::RemoteShareReconciled(summary) => debug
+                .field("kind", &"remote_share_reconciled")
+                .field("summary", summary),
+            Self::PeerShareState(state) => debug
+                .field("kind", &"peer_share_state")
+                .field("state", state),
+            Self::PeerShareRoots(roots) => debug
+                .field("kind", &"peer_share_roots")
+                .field("root_count", &roots.len()),
+            Self::PeerShareDirectory(page) => debug
+                .field("kind", &"peer_share_directory")
+                .field("entry_count", &page.entries.len()),
+            Self::PeerShareEntry(_) => debug.field("kind", &"peer_share_entry"),
+            Self::PeerShareTrash(page) => debug
+                .field("kind", &"peer_share_trash")
+                .field("entry_count", &page.entries.len()),
+            Self::PeerShareMutated(outcome) => debug
+                .field("kind", &"peer_share_mutated")
+                .field("outcome", outcome),
+            Self::PeerShareUploaded(summary) => debug
+                .field("kind", &"peer_share_uploaded")
+                .field("files", &summary.files)
+                .field("skipped", &summary.skipped),
+            Self::PeerShareDownloaded(summary) => debug
+                .field("kind", &"peer_share_downloaded")
+                .field("size_bytes", &summary.size_bytes),
+            Self::PeerShareTransferCancellation(outcome) => debug
+                .field("kind", &"peer_share_transfer_cancellation")
                 .field("outcome", outcome),
         };
         debug.finish()

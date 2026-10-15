@@ -588,6 +588,8 @@ pub async fn prepare_sync_session(
     let remote_share_client = Arc::new(RemoteShareClient::new(RemoteShareClientDeps {
         client: remote_share_client_port,
         blobs: Arc::clone(&blob_transfer),
+        // 终态/下载进度经 HostEventBus 出到宿主（spec §9.1 事件通道）。
+        events: Some(application.host_event_bus()),
     }));
 
     let prepared_session = builder.finish();

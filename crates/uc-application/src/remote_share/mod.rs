@@ -14,8 +14,8 @@ pub(crate) mod transfer;
 
 pub use authorizer::SharePermit;
 pub use client::{
-    RemoteShareClient, RemoteShareClientDeps, ShareOutboundError, ShareUploadItem,
-    ShareUploadReport, ShareUploadSource,
+    RemoteShareClient, RemoteShareClientDeps, ShareDownloadReport, ShareOutboundError,
+    ShareTransferCancelOutcome, ShareUploadItem, ShareUploadReport, ShareUploadSource,
 };
 pub use facade::{RemoteShareFacade, RemoteShareFacadeDeps};
 pub use registry::{ReconcileReport, ShareRootsRegistry};

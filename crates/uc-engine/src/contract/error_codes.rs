@@ -177,6 +177,33 @@ pub const THUMBNAIL_NOT_FOUND_CODE: u32 = 1462;
 pub const ENTRY_FILE_NOT_FOUND_CODE: u32 = 1463;
 pub const RESOURCE_READ_FAILED_CODE: u32 = 1464;
 
+// remote-share（设备文件共享）错误码。deny 数字块 2101–2117 与 spec §12 的
+// 17 个稳定码一一对应（§9.1：daemon 按这张数字码表翻译 API 字符串码）。
+// 非 deny 错误用 2118 起。
+pub const PEER_SHARE_LOCKED_CODE: u32 = 2101;
+pub const PEER_SHARE_UNSUPPORTED_CODE: u32 = 2102;
+pub const PEER_SHARE_UNSUPPORTED_REQUEST_CODE: u32 = 2103;
+pub const PEER_SHARE_SUSPENDED_CODE: u32 = 2104;
+pub const PEER_SHARE_REVOKED_CODE: u32 = 2105;
+pub const PEER_SHARE_DENIED_CODE: u32 = 2106;
+pub const PEER_SHARE_RESERVED_NAME_CODE: u32 = 2107;
+pub const PEER_SHARE_NOT_FOUND_CODE: u32 = 2108;
+pub const PEER_SHARE_CONFLICT_CODE: u32 = 2109;
+pub const PEER_SHARE_ROOT_GONE_CODE: u32 = 2110;
+pub const PEER_SHARE_QUOTA_CODE: u32 = 2111;
+pub const PEER_SHARE_TOO_LARGE_CODE: u32 = 2112;
+pub const PEER_SHARE_TOO_MANY_ENTRIES_CODE: u32 = 2113;
+pub const PEER_SHARE_IO_CODE: u32 = 2114;
+pub const PEER_SHARE_CANCELLED_CODE: u32 = 2115;
+pub const PEER_SHARE_TOO_LATE_CODE: u32 = 2116;
+pub const PEER_SHARE_INTERRUPTED_CODE: u32 = 2117;
+/// 对端不可达 / 帧 IO（可重试）。
+pub const PEER_SHARE_UNAVAILABLE_CODE: u32 = 2118;
+/// 协议违例 / 本地编排失败。
+pub const PEER_SHARE_FAILED_CODE: u32 = 2119;
+/// 本机共享清单读写失败。
+pub const REMOTE_SHARE_STATE_FAILED_CODE: u32 = 2120;
+
 #[cfg(test)]
 mod tests {
     use super::*;
