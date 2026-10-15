@@ -36,6 +36,7 @@ cap-std = "4.0.3"
 # ===== Blob/profile ciphertext ports consumed by migration_state only =====
 uc-observability-contract = { path = "../uc-observability-contract" }
 uuid = { version = "1.10.0", features = ["v4"] }
+cap-fs-ext = "4.0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

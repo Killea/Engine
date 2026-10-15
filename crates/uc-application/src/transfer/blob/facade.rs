@@ -1147,6 +1147,14 @@ mod tests {
             Err(BlobError::Internal("unused".into()))
         }
 
+        async fn publish_reader(
+            &self,
+            _source: std::fs::File,
+            _reason: TagReason,
+        ) -> Result<BlobDigest, BlobError> {
+            Err(BlobError::Internal("unused".into()))
+        }
+
         async fn issue_ticket(&self, _digest: &BlobDigest) -> Result<BlobTicket, BlobError> {
             Err(BlobError::Internal("unused".into()))
         }

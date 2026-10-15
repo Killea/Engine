@@ -13,7 +13,8 @@ use cap_std::fs::Dir;
 use tempfile::TempDir;
 
 use uc_core::ports::remote_share::{
-    is_well_formed_relative, ConfineError, ShareConfinementPort, ShareRootId,
+    is_reserved_share_component, is_well_formed_relative, ConfineError, ConflictPolicy,
+    ShareConfinementPort, ShareRootId, ShareStagedEntry,
 };
 use uc_infra_local::fs::CapStdConfinement;
 
@@ -196,6 +197,7 @@ const ESCAPE_CORPUS: &[&str] = &[
     "\\\\?\\C:\\Windows",                    // 长路径前缀
     "PUBLIC/../outside/secret.txt",          // 大小写不敏感前缀绕过
     ".uniclipboard-trash-00000000/anything", // 保留前缀
+    ".uniclipboard-staging-00000000/x",      // 暂存保留前缀
     "",
     "\0",
     "link_secret",                      // 末段是逃出根的符号链接
@@ -206,9 +208,8 @@ const ESCAPE_CORPUS: &[&str] = &[
     ".. ",   // 结尾空格：Linux 上是字面名，Windows 上是 `..`
     ".../x", // 纯点段：Windows 折叠后为空/非法，不得下行
     ". /x",  // 点+空格段：同上
-    // 终评 Important 3：Windows 保留设备名。本层从不打开末段，库层的设备名过滤因此不生效，
-    // `resolve(root, "CON")` 会返回 `Ok` 且 `real_path = <root>\CON`——调用方随后的环境权限
-    // 打开落到 Win32 命名空间的设备而非共享树。三条断言在**每个宿主**上都把它挡下。
+    // 终评 Important 3：Windows 保留设备名。内核从不打开末段，库层的设备名过滤因此不生效，
+    // 设备名打开会落到 Win32 命名空间的设备而非共享树。三条断言在**每个宿主**上都把它挡下。
     "CON",
     "nul.log",
     "a/CON/b",
@@ -223,6 +224,7 @@ const ESCAPE_CORPUS: &[&str] = &[
 const WALK_STAGE_DENIALS: &[&str] = &[
     "escape/secret.txt",
     ".uniclipboard-trash-00000000/anything",
+    ".uniclipboard-staging-00000000/x",
     "link_secret",
     "link_to_public/n.md",
     ".Uniclipboard-Trash-abc/notes.md",
@@ -271,11 +273,13 @@ async fn every_corpus_entry_is_denied_for_the_right_reason() {
             ConfineError::Denied => "denied",
             ConfineError::ReservedName => "reserved",
             ConfineError::RootGone => "root_gone",
+            ConfineError::NotFound => "not_found",
+            ConfineError::Conflict => "conflict",
+            ConfineError::NotADirectory => "not_a_directory",
+            ConfineError::IsADirectory => "is_a_directory",
             ConfineError::Io { .. } => "io",
         };
-        let expected = if *client_rel == ".uniclipboard-trash-00000000/anything"
-            || *client_rel == ".Uniclipboard-Trash-abc/notes.md"
-        {
+        let expected = if is_reserved_share_component(client_rel.split('/').next().unwrap_or("")) {
             "reserved"
         } else {
             "denied"
@@ -302,7 +306,8 @@ async fn denial_messages_never_echo_paths() {
     }
 }
 
-/// 反向保障：没把合法路径一起锁死。
+/// 反向保障：没把合法路径一起锁死。句柄化之后目标不再携带 `real_path`，
+/// "它能读到内容"即"它落在登记的那棵树里"的行为级证明。
 #[tokio::test]
 async fn legitimate_relative_paths_resolve() {
     let harness = Harness::new().await;
@@ -312,10 +317,17 @@ async fn legitimate_relative_paths_resolve() {
         .resolve(harness.root_id, "public/notes.md")
         .await
         .expect("legitimate path must resolve");
-    assert!(target
-        .real_path
-        .ends_with(std::path::Path::new("public/notes.md")));
     assert_eq!(target.relative, std::path::Path::new("public/notes.md"));
+
+    let mut file = harness
+        .confinement
+        .target_open_read(&target)
+        .await
+        .expect("合法目标必须可读");
+    let mut content = String::new();
+    use std::io::Read;
+    file.read_to_string(&mut content).expect("read");
+    assert_eq!(content, "notes");
 }
 
 /// 末段允许尚不存在（规格 §7 的 `Mkdir`/`StageUpload` 要在落位前拿到目标路径），
@@ -329,17 +341,19 @@ async fn absent_leaf_is_allowed_but_absent_or_non_directory_middle_is_not() {
         .resolve(harness.root_id, "public/new-upload.part")
         .await
         .expect("尚未创建的末段必须可以解析，否则上传无法落位");
-    assert!(target
-        .real_path
-        .ends_with(std::path::Path::new("public/new-upload.part")));
+    assert_eq!(
+        target.relative,
+        std::path::Path::new("public/new-upload.part")
+    );
 
-    // 中间段不存在：不得凭空造出一条可写的绝对路径来。
+    // 中间段不存在：`NotFound`（授权根内的"存在与否"对端本就可经列举获得，
+    // 不构成额外泄漏，故如实分类而不是一律不透明拒绝）。
     assert!(matches!(
         harness
             .confinement
             .resolve(harness.root_id, "no-such-dir/x.md")
             .await,
-        Err(ConfineError::Denied)
+        Err(ConfineError::NotFound)
     ));
     // 中间段是普通文件：不得穿过它继续下行。
     assert!(matches!(
@@ -382,17 +396,17 @@ async fn the_root_itself_is_addressable_and_stays_inside_the_registered_tree() {
         "根目标的 relative 必须为空，实际 {target:?}",
     );
 
-    // 落在**登记的那棵树**里：等于登记时定稿（`canonicalize`）后的 `<tmp>/root`。
-    let registered = std::fs::canonicalize(harness.tmp().join("root")).expect("canonical root");
-    assert_eq!(
-        target.real_path, registered,
-        "根目标必须就是登记时定稿的那棵树"
+    // 落在**登记的那棵树**里：这个目录里确实有 `public`，即它就是 `List` 要
+    // 列举的那一层——句柄化之后以 `target_read_dir` 为行为级证明。
+    let entries = harness
+        .confinement
+        .target_read_dir(&target)
+        .await
+        .expect("root listing");
+    assert!(
+        entries.iter().any(|entry| entry.name == "public"),
+        "根目标列举里没有预期的 public"
     );
-    // 反向对照：这个目录里确实有 `public`，即它就是 `List` 要列举的那一层。
-    assert!(std::fs::read_dir(&target.real_path)
-        .expect("read root")
-        .filter_map(std::result::Result::ok)
-        .any(|entry| entry.file_name() == "public"));
 
     // 与 `resolve` 同一套失败分类：未注册 ⇒ `RootGone`，绝不降级为全盘可见。
     let unregistered = ShareRootId(uuid::Uuid::new_v4());
@@ -483,14 +497,15 @@ async fn reserved_prefix_variants_are_reported_distinctly() {
     }
 
     // 反向保障：裸前缀不是保留名（规格 §6.1 只保留 `.uniclipboard-trash-<id>`），
-    // 不得把它连同用户数据一起误挡。这里它因不存在而被拒，但理由必须是 Denied。
+    // 不得把它连同用户数据一起误挡。这里它因中间段不存在而被拒——关键是
+    // 理由如实报 `NotFound` 而不是 `ReservedName`。
     let error = harness
         .confinement
         .resolve(harness.root_id, ".uniclipboard-trash/notes.md")
         .await
         .expect_err("不存在的目录仍须被拒");
     assert!(
-        matches!(error, ConfineError::Denied),
+        matches!(error, ConfineError::NotFound),
         "裸前缀被误判成保留名"
     );
 }
@@ -612,8 +627,8 @@ async fn register_failure_leaves_no_half_registered_root() {
         .await
         .expect_err("普通文件不能当共享根");
     assert!(
-        matches!(file_error, ConfineError::Io { .. }),
-        "非目录的登记失败要保留底层来源，不得谎报成根被删除，实际 {file_error:?}"
+        matches!(file_error, ConfineError::RootGone),
+        "非目录的根同样收编为 RootGone，实际 {file_error:?}"
     );
     assert!(!confinement.is_registered(as_file).await);
 
@@ -624,10 +639,6 @@ async fn register_failure_leaves_no_half_registered_root() {
 
 /// 端口形状本身的可观察行为：登记/撤销与 `is_registered` 一致；同 id 重注册以最后一次为准，
 /// 旧路径不再可见；撤销后 `is_registered` 转假，且对同一 `root_id` 的**新解析**不再成功。
-///
-/// 注意本用例只覆盖"新解析"这一侧——它并不声称、也无法声称"已返回的 `ConfinedTarget` 在
-/// 撤销后失效"：`real_path` 只是路径字符串，本层不持有句柄，撤销管不到调用方随后那次环境
-/// 权限打开（见 `ConfinedTarget` 文档；对既有目标真正失效需要 P2 的不透明句柄端口）。
 #[tokio::test]
 async fn registration_lifecycle_is_observable() {
     let tmp = extended_fixture();
@@ -652,14 +663,406 @@ async fn registration_lifecycle_is_observable() {
         .resolve(root_id, "secret.txt")
         .await
         .expect("re-registered root");
-    assert!(target
-        .real_path
-        .ends_with(std::path::Path::new("secret.txt")));
+    assert_eq!(target.relative, std::path::Path::new("secret.txt"));
+    // 新根（outside）下没有 public：中间段不存在如实报 `NotFound`。
     assert!(matches!(
         confinement.resolve(root_id, "public/n.md").await,
-        Err(ConfineError::Denied)
+        Err(ConfineError::NotFound)
     ));
 
     confinement.unregister_root(root_id).await;
     assert!(!confinement.is_registered(root_id).await);
+}
+
+/// P2 句柄化的关键语义：撤销登记后**已发出的目标**同步失效——token 含登记表代际，
+/// 撤销即作废。这条钉住的正是 P1 `real_path` 快照做不到的吊销。
+#[tokio::test]
+async fn issued_targets_are_revoked_on_unregister() {
+    let harness = Harness::new().await;
+    let target = harness
+        .confinement
+        .resolve(harness.root_id, "public/n.md")
+        .await
+        .expect("resolve before unregister");
+
+    harness.confinement.unregister_root(harness.root_id).await;
+
+    assert!(
+        matches!(
+            harness.confinement.target_metadata(&target).await,
+            Err(ConfineError::RootGone)
+        ),
+        "已发出的目标必须在撤销后失效"
+    );
+    assert!(matches!(
+        harness.confinement.target_open_read(&target).await,
+        Err(ConfineError::RootGone)
+    ));
+}
+
+/// P2 的根生命周期收口：根目录被**换走**（同路径重建）也必须 `RootGone`，
+/// 不能只靠 `is_dir()`。检测靠登记时捕获的 `dev`/`ino` 身份与使用前的身份复核。
+#[tokio::test]
+async fn root_replaced_in_place_is_root_gone() {
+    let harness = Harness::new().await;
+    assert!(harness
+        .confinement
+        .resolve(harness.root_id, "public/n.md")
+        .await
+        .is_ok());
+
+    // rename-away + 原地新建：路径未变，`is_dir()` 仍为真，但 inode 换了。
+    let root_path = harness.tmp().join("root");
+    fs::rename(&root_path, harness.tmp().join("root-moved-away")).expect("rename away");
+    fs::create_dir_all(root_path.join("public")).expect("rebuild");
+
+    assert!(
+        matches!(
+            harness
+                .confinement
+                .resolve(harness.root_id, "public/n.md")
+                .await,
+            Err(ConfineError::RootGone)
+        ),
+        "同路径重建的根必须识别为身份更换"
+    );
+    assert!(matches!(
+        harness.confinement.resolve_root(harness.root_id).await,
+        Err(ConfineError::RootGone)
+    ));
+}
+
+/// 句柄化目标的元数据与列举走保留句柄、无符号链接跟随。
+#[tokio::test]
+async fn target_ops_use_the_retained_handle() {
+    let harness = Harness::new().await;
+    let target = harness
+        .confinement
+        .resolve(harness.root_id, "public")
+        .await
+        .expect("resolve dir");
+
+    let meta = harness
+        .confinement
+        .target_metadata(&target)
+        .await
+        .expect("metadata");
+    assert!(meta.is_dir);
+
+    let entries = harness
+        .confinement
+        .target_read_dir(&target)
+        .await
+        .expect("read_dir");
+    assert!(entries.iter().any(|entry| entry.name == "n.md"));
+
+    // 经保留句柄列举不得带出回收/暂存目录（物理存在于根内）。
+    let root = harness
+        .confinement
+        .resolve_root(harness.root_id)
+        .await
+        .expect("root");
+    let root_entries = harness
+        .confinement
+        .target_read_dir(&root)
+        .await
+        .expect("root entries");
+    assert!(root_entries
+        .iter()
+        .all(|entry| !entry.name.starts_with(".uniclipboard-")));
+}
+
+/// 回收站往返：move_to_trash → list_trash 可见 → restore 归位 → 再删 → empty_trash 物理清空。
+#[tokio::test]
+async fn trash_round_trip() {
+    let harness = Harness::new().await;
+    let victim = harness
+        .confinement
+        .resolve(harness.root_id, "public/notes.md")
+        .await
+        .expect("victim");
+
+    let trash_id = harness
+        .confinement
+        .target_move_to_trash(&victim)
+        .await
+        .expect("move to trash");
+    assert!(!trash_id.is_empty());
+    assert!(!harness.tmp().join("root/public/notes.md").exists());
+
+    let page = harness
+        .confinement
+        .list_trash(harness.root_id, None, 64)
+        .await
+        .expect("trash list");
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].trash_id, trash_id);
+    assert_eq!(page.entries[0].original_rel, "public/notes.md");
+
+    // 源位已腾空，原样归位：返回的末段名与原名一致。
+    let restore = harness
+        .confinement
+        .resolve(harness.root_id, "public/notes.md")
+        .await
+        .expect("resolve restore target");
+    let leaf = harness
+        .confinement
+        .restore_from_trash(harness.root_id, &trash_id, &restore)
+        .await
+        .expect("restore");
+    assert_eq!(leaf, "notes.md");
+    assert!(harness.tmp().join("root/public/notes.md").exists());
+
+    // 再删 → 归位到已占用位 → 自动改名。
+    let victim_again = harness
+        .confinement
+        .resolve(harness.root_id, "public/notes.md")
+        .await
+        .expect("victim again");
+    let trash_id2 = harness
+        .confinement
+        .target_move_to_trash(&victim_again)
+        .await
+        .expect("delete again");
+    // 制造占用位：另一个同名文件在归位前出现在源位上。
+    fs::write(harness.tmp().join("root/public/notes.md"), b"occupier").expect("occupier");
+    let renamed_leaf = harness
+        .confinement
+        .restore_from_trash(harness.root_id, &trash_id2, &restore)
+        .await
+        .expect("restore onto occupied");
+    assert_ne!(renamed_leaf, "notes.md", "占用位归位必须自动改名");
+    assert!(harness
+        .tmp()
+        .join("root/public")
+        .join(&renamed_leaf)
+        .exists());
+
+    // 清空回收站。
+    harness
+        .confinement
+        .empty_trash(harness.root_id)
+        .await
+        .expect("empty trash");
+    assert!(harness
+        .confinement
+        .list_trash(harness.root_id, None, 64)
+        .await
+        .expect("list after empty")
+        .entries
+        .is_empty());
+}
+
+/// 暂存→提交往返：`create_staging` 发放内核暂存 id；`staging_entry_path` 给出宿主侧
+/// 落盘位置（只写不进线上载荷）；`commit_staging` 校验清单后原子落位，
+/// AutoRename/Overwrite 两种冲突策略固定；`abort_staging` 清现场。
+#[tokio::test]
+async fn staging_commit_and_abort() {
+    let harness = Harness::new().await;
+    let dest_dir = harness
+        .confinement
+        .resolve(harness.root_id, "public")
+        .await
+        .expect("dest dir");
+
+    // staging 前缀本身被字面筛查挡在客户端路径外。
+    let staged_probe = harness
+        .confinement
+        .resolve(harness.root_id, ".uniclipboard-staging-zzz/x.bin")
+        .await;
+    assert!(matches!(staged_probe, Err(ConfineError::ReservedName)));
+
+    // 开暂存 → 写内容 → 提交到空位。
+    let staging = harness
+        .confinement
+        .create_staging(harness.root_id)
+        .await
+        .expect("create staging");
+    let host_path = harness
+        .confinement
+        .staging_entry_path(harness.root_id, &staging, "new-file.bin", false)
+        .await
+        .expect("staging entry path");
+    fs::write(&host_path, b"blob-bytes").expect("write staging");
+
+    let entries = [ShareStagedEntry {
+        rel: "new-file.bin".to_owned(),
+        is_dir: false,
+        size_bytes: 10,
+    }];
+    harness
+        .confinement
+        .commit_staging(
+            harness.root_id,
+            &staging,
+            &dest_dir,
+            &entries,
+            ConflictPolicy::AutoRename,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(
+        fs::read(harness.tmp().join("root/public/new-file.bin")).expect("committed content"),
+        b"blob-bytes"
+    );
+
+    // 同名再提交：AutoRename 改名落位；Overwrite 覆盖同名文件。
+    let staging2 = harness
+        .confinement
+        .create_staging(harness.root_id)
+        .await
+        .expect("staging 2");
+    let host_path2 = harness
+        .confinement
+        .staging_entry_path(harness.root_id, &staging2, "new-file.bin", false)
+        .await
+        .expect("staging path 2");
+    fs::write(&host_path2, b"v2").expect("write staging 2");
+    harness
+        .confinement
+        .commit_staging(
+            harness.root_id,
+            &staging2,
+            &dest_dir,
+            &[ShareStagedEntry {
+                rel: "new-file.bin".to_owned(),
+                is_dir: false,
+                size_bytes: 2,
+            }],
+            ConflictPolicy::AutoRename,
+        )
+        .await
+        .expect("commit occupied");
+    // 原名仍在，改名副本也在。
+    assert!(harness.tmp().join("root/public/new-file.bin").exists());
+    let renamed_count = fs::read_dir(harness.tmp().join("root/public"))
+        .expect("read public")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("new-file"))
+        .count();
+    assert_eq!(renamed_count, 2, "AutoRename 必须落出一个改名副本");
+
+    let staging3 = harness
+        .confinement
+        .create_staging(harness.root_id)
+        .await
+        .expect("staging 3");
+    let host_path3 = harness
+        .confinement
+        .staging_entry_path(harness.root_id, &staging3, "new-file.bin", false)
+        .await
+        .expect("staging path 3");
+    fs::write(&host_path3, b"v3").expect("write staging 3");
+    harness
+        .confinement
+        .commit_staging(
+            harness.root_id,
+            &staging3,
+            &dest_dir,
+            &[ShareStagedEntry {
+                rel: "new-file.bin".to_owned(),
+                is_dir: false,
+                size_bytes: 2,
+            }],
+            ConflictPolicy::Overwrite,
+        )
+        .await
+        .expect("overwrite commit");
+    assert_eq!(
+        fs::read(harness.tmp().join("root/public/new-file.bin")).expect("overwritten"),
+        b"v3"
+    );
+
+    // abort 清掉残余暂存。
+    let staging4 = harness
+        .confinement
+        .create_staging(harness.root_id)
+        .await
+        .expect("staging 4");
+    let abort_path = harness
+        .confinement
+        .staging_entry_path(harness.root_id, &staging4, "scratch.bin", false)
+        .await
+        .expect("abort path");
+    fs::write(&abort_path, b"scratch").expect("write scratch");
+    harness
+        .confinement
+        .abort_staging(harness.root_id, &staging4)
+        .await
+        .expect("abort");
+    assert!(!abort_path.exists());
+}
+
+/// 同根改名与复制走保留句柄、不允许跨根。
+#[tokio::test]
+async fn rename_and_copy_within_root() {
+    let harness = Harness::new().await;
+    let from = harness
+        .confinement
+        .resolve(harness.root_id, "public/n.md")
+        .await
+        .expect("from");
+    let to = harness
+        .confinement
+        .resolve(harness.root_id, "public/renamed.md")
+        .await
+        .expect("to");
+    harness
+        .confinement
+        .target_rename(&from, &to)
+        .await
+        .expect("rename");
+    assert!(harness.tmp().join("root/public/renamed.md").exists());
+    assert!(!harness.tmp().join("root/public/n.md").exists());
+
+    // 复制文件与递归目录。
+    let dst_file = harness
+        .confinement
+        .resolve(harness.root_id, "public/copy.md")
+        .await
+        .expect("copy dst");
+    harness
+        .confinement
+        .target_copy_into(&to, &dst_file)
+        .await
+        .expect("copy file");
+    assert_eq!(
+        fs::read(harness.tmp().join("root/public/copy.md")).expect("copied"),
+        b"note"
+    );
+
+    let dir_dst = harness
+        .confinement
+        .resolve(harness.root_id, "public-copy")
+        .await
+        .expect("dir dst");
+    let pub_src = harness
+        .confinement
+        .resolve(harness.root_id, "public")
+        .await
+        .expect("pub src");
+    harness
+        .confinement
+        .target_copy_into(&pub_src, &dir_dst)
+        .await
+        .expect("copy dir");
+    assert!(harness.tmp().join("root/public-copy/copy.md").exists());
+
+    // 跨根 rename 必须不透明拒绝，绝不静默跨树搬运。
+    let other = extended_fixture();
+    let other_id = ShareRootId(uuid::Uuid::new_v4());
+    harness
+        .confinement
+        .register_root(other_id, &other.path().join("root"))
+        .await
+        .expect("other root");
+    let foreign = harness
+        .confinement
+        .resolve(other_id, "public")
+        .await
+        .expect("foreign");
+    assert!(matches!(
+        harness.confinement.target_rename(&pub_src, &foreign).await,
+        Err(ConfineError::Denied)
+    ));
 }

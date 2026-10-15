@@ -390,6 +390,18 @@ mod tests {
             self.publish(Bytes::from(bytes), reason).await
         }
 
+        async fn publish_reader(
+            &self,
+            mut source: std::fs::File,
+            reason: TagReason,
+        ) -> Result<BlobDigest, BlobError> {
+            // Fake-only: same read-into-memory shortcut as `publish_path`.
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut source, &mut bytes)
+                .map_err(|e| BlobError::Internal(e.into()))?;
+            self.publish(Bytes::from(bytes), reason).await
+        }
+
         async fn issue_ticket(&self, digest: &BlobDigest) -> Result<BlobTicket, BlobError> {
             Ok(BlobTicket::from_bytes(digest.as_bytes().to_vec()))
         }

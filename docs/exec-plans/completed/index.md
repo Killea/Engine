@@ -53,3 +53,4 @@
 - [Profile 内容密钥运行期复用](profile-content-key-runtime-reuse.md)（实现完成；含已知全量测试失败与 GUI 验收跳过记录）
 - [模块日志通道与错误链](2026-09-29-module-log-channel.md)（已完成；错误层登记已由 `ErrorClass` 取代）
 - [类型化日志事件与工具链强制](2026-09-29-typed-log-events.md)（已完成；Windows 与 Android 编译、CI 真实耗时记为跳过）
+- [设备文件共享 P3–P4（句柄化约束 / 变更 RPC / 传输编排 / 根注册责任人）](2026-10-14-device-file-share-p3-p4.md)（已完成；upgrade-matrix 环境缺口与三平台验收如实记为跳过）

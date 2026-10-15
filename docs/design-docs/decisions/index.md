@@ -34,3 +34,4 @@ ADR 记录重要取舍的背景、备选方案和后果。编号保持历史稳�
 - [ADR-033：Rust 构建与测试统一使用 MBX](033-unified-mbx-rust-builds.md)
 - [ADR-034：共享根路径约束以 cap-std 为原语](034-share-path-confinement-cap-std.md)
 - [ADR-035：共享根清单用 Space 派生子密钥密封](035-share-store-space-subkey.md)
+- [ADR-036：`remote-share/1` 线格式约定与内容寻址残余风险的接受](036-remote-share-alpn-blob-addressing.md)

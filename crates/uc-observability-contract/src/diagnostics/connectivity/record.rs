@@ -177,6 +177,9 @@ pub(super) enum LocalEvent {
         protocol: InboundPeerProtocol,
         reason: InboundPeerRejectionReason,
     },
+    RemoteShareOp {
+        record: super::remote_share::RemoteShareEvent,
+    },
     LocalIdentityChanged {
         state: LocalIdentityState,
     },
@@ -210,6 +213,7 @@ impl LocalEvent {
             Self::PresenceCheck { .. } => "presence.check.completed",
             Self::PresenceClosed { .. } => "presence.connection.closed",
             Self::InboundPeerRejected { .. } => "peer.inbound.rejected",
+            Self::RemoteShareOp { record } => record.name(),
             Self::LocalIdentityChanged { .. } => "space.local_identity.changed",
             Self::SessionStarted { .. } => "session.transition.started",
             Self::SessionLockWait { .. } => "session.lock.waited",
@@ -229,6 +233,7 @@ impl LocalEvent {
             Self::Address { record } => record.level(),
             Self::Connection { record } => record.level(),
             Self::InboundPeerRejected { .. } => "WARN",
+            Self::RemoteShareOp { record } => record.level(),
             Self::LocalIdentityChanged {
                 state: LocalIdentityState::Mismatch,
             } => "WARN",
@@ -393,6 +398,7 @@ impl LocalEvent {
                 fields.insert("error.phase".into(), json!(reason.phase()));
                 fields.insert("error.reason".into(), json!(reason));
             }
+            Self::RemoteShareOp { record } => fields.extend(record.fields()),
             Self::LocalIdentityChanged { state } => {
                 fields.insert("state".into(), json!(state));
                 fields.insert(

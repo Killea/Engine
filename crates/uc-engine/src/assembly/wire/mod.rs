@@ -983,8 +983,9 @@ pub async fn wire_dependencies_from_inputs(
             device_identity: platform.device_identity,
             member_repo: Arc::clone(&member_repo),
         },
-        // 根目录的注册属于"用户显式添加共享根"动作（P5 daemon 路由驱动），装配层只建
-        // 空表，绝不在启动时打开任何用户目录。
+        // 装配层只建空表；把持久化清单收敛进登记表是会话装配期
+        // `ShareRootsRegistry::reconcile_startup` 的职责（见 sync_engine.rs），
+        // 用户后续的分享/撤销写路径也收敛于同一责任人。
         remote_share: RemoteSharePorts {
             confinement: Arc::new(CapStdConfinement::new()),
         },

@@ -329,6 +329,7 @@ __log_field_catalog! {
     active_time_ms: Scalar,
     add_bytes_ms: Scalar,
     add_path_ms: Scalar,
+    add_stream_ms: Scalar,
     addr_count: Scalar,
     advanced: Scalar,
     affected_device_count: Scalar,

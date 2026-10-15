@@ -19,6 +19,7 @@ use iroh_blobs::{
     BlobFormat, Hash, HashAndFormat,
 };
 use iroh_tickets::Ticket;
+use tokio_util::io::ReaderStream;
 use tracing::instrument;
 
 use uc_core::ports::blob::{
@@ -123,6 +124,9 @@ impl IrohBlobTransferAdapter {
         match reason {
             TagReason::ClipboardEntry(entry_id) => {
                 format!("uc-clipboard-entry:{}", entry_id.as_ref())
+            }
+            TagReason::RemoteShareExport(lease_id) => {
+                format!("uc-remote-share-export:{lease_id}")
             }
         }
     }
@@ -237,6 +241,35 @@ impl BlobTransferPort for IrohBlobTransferAdapter {
             add_path_ms = started.elapsed().as_millis() as u64,
             mode = log_vocab_debug(&mode),
             "iroh blob publish: add_path completed (streaming)"
+        );
+        Ok(Self::core_digest(haf.hash))
+    }
+
+    #[instrument(skip_all)]
+    async fn publish_reader(
+        &self,
+        source: std::fs::File,
+        reason: TagReason,
+    ) -> Result<BlobDigest, BlobError> {
+        // Remote-share export: the caller hands over a verified no-follow fd,
+        // not a path — `add_stream` ingests it incrementally, so peak memory
+        // stays bounded regardless of file size (the same streaming rationale
+        // as `publish_path`). Same Phase F `with_named_tag` treatment: the
+        // caller's `TagReason` is attached at admission, no orphan auto-tag.
+        let started = Instant::now();
+        let tag_name = Self::tag_name(&reason);
+        let stream = ReaderStream::new(tokio::fs::File::from_std(source));
+        let haf = self
+            .store
+            .blobs()
+            .add_stream(stream)
+            .await
+            .with_named_tag(tag_name.as_bytes())
+            .await
+            .map_err(|e| BlobError::Internal(e.into()))?;
+        uc_info!(
+            add_stream_ms = started.elapsed().as_millis() as u64,
+            "iroh blob publish: add_stream completed (fd)"
         );
         Ok(Self::core_digest(haf.hash))
     }

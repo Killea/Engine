@@ -341,8 +341,9 @@ pub struct SecurityPorts {
 pub struct RemoteSharePorts {
     /// 共享根的路径约束内核。
     ///
-    /// 装配层只给出空表；根目录的注册与撤销由"用户显式添加共享根"的动作驱动，
-    /// 不在组合根里打开任何用户目录。
+    /// 装配层只给出空表；登记表与持久化清单的收敛由 `ShareRootsRegistry`
+    /// 统一承担：启动 reconcile 登记启用根、写路径 `replace_doc` 同事务收敛、
+    /// 挂起或会话结束时全量撤销。除此之外没有任何注册/撤销入口。
     pub confinement: Arc<dyn ShareConfinementPort>,
 }
 

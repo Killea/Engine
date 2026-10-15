@@ -7,8 +7,11 @@
 
 pub(crate) mod authorizer;
 pub(crate) mod facade;
+pub(crate) mod registry;
 pub(crate) mod serve_handler;
+pub(crate) mod transfer;
 
 pub use authorizer::SharePermit;
 pub use facade::{RemoteShareFacade, RemoteShareFacadeDeps};
+pub use registry::{ReconcileReport, ShareRootsRegistry};
 pub use serve_handler::{RemoteShareServe, RemoteShareServeDeps};

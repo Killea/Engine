@@ -110,6 +110,9 @@ impl BlobTicket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagReason {
     ClipboardEntry(EntryId),
+    /// 远端共享导出暂挂：字符串是按次生成的不透明租约 id，租约到期或
+    /// 会话结束后由流程负责人经 [`BlobTransferPort::untag`] 释放。
+    RemoteShareExport(String),
 }
 
 /// Business-level errors for [`BlobTransferPort`] operations.
@@ -233,6 +236,21 @@ pub trait BlobTransferPort: Send + Sync {
     async fn publish_path(
         &self,
         path: &std::path::Path,
+        reason: TagReason,
+    ) -> Result<BlobDigest, BlobError>;
+
+    /// Place the contents of an already-open file handle into the shareable
+    /// store and atomically declare a tag for it, returning its stable local
+    /// identity. Adapters MAY stream from the descriptor; peak memory must
+    /// stay bounded regardless of file size.
+    ///
+    /// Same tag/idempotence semantics as [`publish_path`](Self::publish_path).
+    /// Callers that hold a verified capability rather than a path (an fd
+    /// opened no-follow inside a confinement registry) use this to avoid a
+    /// re-open TOCTOU window the path-based call cannot close.
+    async fn publish_reader(
+        &self,
+        source: std::fs::File,
         reason: TagReason,
     ) -> Result<BlobDigest, BlobError>;
 

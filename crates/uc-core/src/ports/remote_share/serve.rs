@@ -27,6 +27,7 @@ use std::fmt;
 use async_trait::async_trait;
 
 use crate::ids::DeviceId;
+use crate::ports::blob::BlobTicket;
 
 use super::{ShareGrants, ShareRootId};
 
@@ -84,6 +85,10 @@ impl fmt::Debug for ShareRootDescriptor {
 pub struct ShareDirectoryEntry {
     pub name: String,
     pub is_dir: bool,
+    /// The entry is a symlink. Such entries are honest parts of the listing but
+    /// cannot be addressed by any path operation (the confinement layer denies
+    /// every symlink leaf), so clients should render them as inert.
+    pub is_symlink: bool,
     pub size_bytes: u64,
     pub modified_at_ms: i64,
 }
@@ -94,6 +99,7 @@ impl fmt::Debug for ShareDirectoryEntry {
         f.debug_struct("ShareDirectoryEntry")
             .field("name", &"[REDACTED]")
             .field("is_dir", &self.is_dir)
+            .field("is_symlink", &self.is_symlink)
             .field("size_bytes", &self.size_bytes)
             .field("modified_at_ms", &self.modified_at_ms)
             .finish()
@@ -126,9 +132,9 @@ impl fmt::Debug for ShareDirectoryPage {
 
 /// Why a serve operation was denied or failed.
 ///
-/// Maps onto the wire `DenyCode` (spec §5.2 / §6); the mapping is total and lives in
-/// the serve adapter. Every variant is an opaque classification with no payload — no
-/// path, label, file name, or lower-layer error text (spec §6, §13).
+/// Maps onto the wire `DenyCode` (spec §5.2 / §6 / §12); the mapping is total and
+/// lives in the serve adapter. Every variant is an opaque classification with no
+/// payload — no path, label, file name, or lower-layer error text (spec §6, §13).
 #[derive(Debug, thiserror::Error)]
 pub enum ShareServeError {
     /// The store could not be read (space not unlocked / corrupt / over capacity).
@@ -154,14 +160,160 @@ pub enum ShareServeError {
     /// The whole device has sharing switched off.
     #[error("sharing is suspended")]
     Suspended,
-    /// The root is authorized but not registered in the confinement registry. The
-    /// registry and the store are not kept in sync by either one (see
-    /// `ShareConfinementPort`); mapped to `NotFound` on the wire.
+    /// The root is authorized but not registered in the confinement registry, or the
+    /// root directory was moved/replaced on disk since registration.
     #[error("shared root is unavailable")]
     RootGone,
-    /// An I/O failure while reading the confined path.
+    /// The destination name already exists where the operation required a new name.
+    #[error("destination already exists")]
+    Conflict,
+    /// The operation or request shape is not supported by this build/peer.
+    #[error("request not supported")]
+    UnsupportedRequest,
+    /// A staging session or transfer does not exist (unknown id, or peer mismatch).
+    /// Surfaced as `NotFound` on the wire.
+    #[error("staging session not found")]
+    StagingNotFound,
+    /// The staged set exceeds a count/size bound (`too_many_entries` / `too_large`).
+    #[error("transfer exceeds the configured limit")]
+    TooLarge,
+    /// The operation arrived after the point it could still be honoured
+    /// (e.g. cancel after the upload was already committed).
+    #[error("operation arrived too late")]
+    TooLate,
+    /// An I/O failure while serving the request.
     #[error("share control plane i/o failure")]
     Io,
+}
+
+/// One entry in the holder's recycle directory (`ListTrash`).
+///
+/// `original_rel` is the entry's former relative path inside the shared root —
+/// relative only, and inside the authorized namespace (spec §7, §13 I2).
+/// `trash_id` is the kernel-issued opaque name used by `Restore`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShareTrashEntry {
+    pub trash_id: String,
+    pub original_rel: String,
+    pub deleted_at_ms: i64,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+}
+
+/// Hand-written `Debug`: `original_rel` is user content.
+impl fmt::Debug for ShareTrashEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareTrashEntry")
+            .field("trash_id", &self.trash_id)
+            .field("original_rel", &"[REDACTED]")
+            .field("deleted_at_ms", &self.deleted_at_ms)
+            .field("is_dir", &self.is_dir)
+            .field("size_bytes", &self.size_bytes)
+            .finish()
+    }
+}
+
+/// One page of the recycle listing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShareTrashPage {
+    pub entries: Vec<ShareTrashEntry>,
+    pub next_after: Option<String>,
+}
+
+/// Hand-written `Debug`: the cursor is an opaque `trash_id`, shown for correlation.
+impl fmt::Debug for ShareTrashPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareTrashPage")
+            .field("entries", &self.entries)
+            .field("next_after", &self.next_after)
+            .finish()
+    }
+}
+
+/// One manifest item of a `StageUpload` request, after wire decoding.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShareStageEntry {
+    /// Relative path inside the staging set (and later inside `dir`).
+    pub rel: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+    /// The fetch credential the uploader issued for this entry's content.
+    /// `Some` for every file entry; `None` for directories, which carry no
+    /// bytes and are materialised at stage time.
+    pub ticket: Option<BlobTicket>,
+}
+
+/// Hand-written `Debug`: `rel` is user content and `ticket` embeds a peer
+/// address + digest — neither may reach a log line.
+impl fmt::Debug for ShareStageEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareStageEntry")
+            .field("rel", &"[REDACTED]")
+            .field("is_dir", &self.is_dir)
+            .field("size_bytes", &self.size_bytes)
+            .field("ticket", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// One upload task's progress-correlation key.
+///
+/// The 16 bytes the uploader chose in `StageUpload`; the holder reports its
+/// blob-pull progress under this key so the uploader's task tracker can attach
+/// it to the parent transfer (spec §8.1 step 4, §8.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShareTransferId([u8; 16]);
+
+impl ShareTransferId {
+    /// Wrap the raw 16 bytes from the wire.
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+    /// The raw bytes back onto the wire.
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+    /// The UUID-string form the `OutboundProgressReporterPort` correlation key
+    /// expects — the same 16 bytes in canonical `8-4-4-4-12` spelling.
+    pub fn as_uuid_string(&self) -> String {
+        uuid::Uuid::from_bytes(self.0).to_string()
+    }
+}
+
+/// The outcome of `StageUpload`: the kernel-issued staging id the client
+/// addresses with `CommitUpload`/`AbortUpload`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShareStageOutcome {
+    pub staging_id: String,
+}
+
+/// Hand-written `Debug`: the id is kernel-issued and opaque, safe to print.
+impl fmt::Debug for ShareStageOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareStageOutcome")
+            .field("staging_id", &self.staging_id)
+            .finish()
+    }
+}
+
+/// The outcome of `Export`: the fetch ticket + announced size the peer pulls
+/// the blob with. The published bytes stay pinned under a
+/// `TagReason::RemoteShareExport` lease until it expires, so the peer may fetch
+/// lazily after the control-plane reply.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShareExportOutcome {
+    pub ticket: BlobTicket,
+    pub size_bytes: u64,
+}
+
+/// Hand-written `Debug`: the ticket embeds a peer address + digest.
+impl fmt::Debug for ShareExportOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareExportOutcome")
+            .field("ticket", &"[REDACTED]")
+            .field("size_bytes", &self.size_bytes)
+            .finish()
+    }
 }
 
 /// The serve-side control-plane port: answer an already-admitted peer's request with
@@ -210,4 +362,113 @@ pub trait RemoteShareServePort: Send + Sync {
         root: ShareRootId,
         rel: &str,
     ) -> Result<ShareDirectoryEntry, ShareServeError>;
+
+    /// Create a directory at `rel` (requires `write`). The leaf must not already
+    /// exist (`Conflict`); missing intermediate dirs are `NotFound`.
+    async fn mkdir(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        rel: &str,
+    ) -> Result<(), ShareServeError>;
+
+    /// Move `from` to `to` inside the same root (requires `write` + `delete`,
+    /// spec §5.2). `to` existing is `Conflict`; moving the root itself is denied.
+    async fn rename(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        from: &str,
+        to: &str,
+    ) -> Result<(), ShareServeError>;
+
+    /// Move `rel` into the root's recycle directory (requires `delete`) and
+    /// return the kernel-issued `trash_id` the `restore` op takes as its
+    /// handle. Deleting the root itself is denied.
+    async fn delete(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        rel: &str,
+    ) -> Result<String, ShareServeError>;
+
+    /// Copy `from` to `to` inside the same root (requires `write`). Directories
+    /// copy recursively; symlink entries inside a copied tree are skipped.
+    /// `to` existing is `Conflict`.
+    async fn copy_within(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        from: &str,
+        to: &str,
+    ) -> Result<(), ShareServeError>;
+
+    /// Page through the root's recycle directory (requires `delete` — the recycle
+    /// namespace is unreachable without it). `after`/`limit` page by `trash_id`.
+    async fn list_trash(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ShareTrashPage, ShareServeError>;
+
+    /// Move a recycled entry back to `to` (requires `write` + `delete` — the entry
+    /// leaves the holder-controlled namespace). Name collisions auto-rename.
+    async fn restore(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        trash_id: &str,
+        to: &str,
+    ) -> Result<(), ShareServeError>;
+
+    /// Permanently empty the root's recycle directory (requires `delete`).
+    async fn empty_trash(&self, peer: &DeviceId, root: ShareRootId) -> Result<(), ShareServeError>;
+
+    /// Open a staging set under `dir` and register a manifest slice
+    /// (requires `write`). The holder immediately begins pulling every file
+    /// entry's `ticket` into the staging area and reports its pull progress
+    /// under `transfer_id` on the progress back-channel (spec §8.1 step 4).
+    /// Returns the kernel-issued `staging_id`. May be called repeatedly; one
+    /// upload task may accumulate several `staging_id`s (the request-size cap
+    /// bounds one manifest slice).
+    async fn stage_upload(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        dir: &str,
+        entries: &[ShareStageEntry],
+        transfer_id: ShareTransferId,
+    ) -> Result<ShareStageOutcome, ShareServeError>;
+
+    /// Commit previously staged sets into their target dirs (requires `write`
+    /// per set; the staging session remembers its own root/dir/peer). Unknown or
+    /// foreign `staging_id`s are `StagingNotFound`. The call waits for any
+    /// still-in-flight fetches of the set to settle, then lands every staged
+    /// entry atomically; a failed fetch fails the commit and discards the set.
+    async fn commit_upload(
+        &self,
+        peer: &DeviceId,
+        staging_ids: &[String],
+    ) -> Result<(), ShareServeError>;
+
+    /// Discard staged sets (requires `write` per set). Unknown ids are ignored —
+    /// abort is idempotent so a cancelled upload can always be cleaned up.
+    async fn abort_upload(
+        &self,
+        peer: &DeviceId,
+        staging_ids: &[String],
+    ) -> Result<(), ShareServeError>;
+
+    /// Publish `rel` as a blob (requires `read`): the verified, no-follow file
+    /// handle is streamed into the local blob store under a pinned export
+    /// lease, and the fetch ticket + announced size come back for the peer to
+    /// pull with (spec §8.2 step 1).
+    async fn export(
+        &self,
+        peer: &DeviceId,
+        root: ShareRootId,
+        rel: &str,
+    ) -> Result<ShareExportOutcome, ShareServeError>;
 }

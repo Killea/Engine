@@ -25,6 +25,7 @@ pub use local_work::{
 pub use maintenance::{
     record_pending_group_updates, MaintenanceDisposition, MaintenanceObservation,
 };
+pub use remote_share::{record_remote_share_op, RemoteShareDeny, RemoteShareOp};
 
 pub use address_record::{
     local_address_record_keys, AddressRecordResult, StoredAddressObservation,
@@ -42,6 +43,7 @@ mod membership_history;
 mod network_recovery;
 mod physical;
 mod record;
+mod remote_share;
 mod source;
 pub use source::{LocalDiagnosticSource, SourceCapability, SourceCollection};
 

@@ -197,6 +197,26 @@ pub fn is_windows_reserved_device_name(name: &str) -> bool {
     WINDOWS_RESERVED_DEVICE_NAMES.contains(&stem)
 }
 
+/// 规格 §6.1：`.uniclipboard-staging-<staging_id>` 为上传暂存目录的保留前缀。
+///
+/// 归一化、等价类残留与"谓词即唯一权威记录"的约定与 [`is_reserved_trash_component`]
+/// 完全相同，见该函数文档。
+#[must_use]
+pub fn is_reserved_staging_component(name: &str) -> bool {
+    normalize_share_component(name)
+        .strip_prefix(".uniclipboard-staging-")
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
+/// 规格 §6.1 的合并谓词：段名是否落入任一内核保留命名空间
+/// （回收目录 `.uniclipboard-trash-*` 或上传暂存 `.uniclipboard-staging-*`）。
+///
+/// 逐段行走、登记扫描与列举过滤都只问这一个问题，保证三条路径给出同一答案。
+#[must_use]
+pub fn is_reserved_share_component(name: &str) -> bool {
+    is_reserved_trash_component(name) || is_reserved_staging_component(name)
+}
+
 /// 规格 §6.1：`.uniclipboard-trash-<root_id>` 为保留前缀，用户内容不得占用。
 ///
 /// 判定先经 [`normalize_share_component`] 折叠大小写与结尾点/空格，再比对前缀，

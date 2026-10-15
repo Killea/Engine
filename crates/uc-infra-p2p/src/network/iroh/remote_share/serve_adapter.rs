@@ -31,17 +31,22 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use uc_application::deps::PeerIdentityDirectoryPort;
 use uc_core::ids::DeviceId;
 use uc_core::membership::PeerAdmissionPort;
+use uc_core::ports::blob::BlobTicket;
 use uc_core::ports::remote_share::{
     RemoteShareServePort, ShareAvailability, ShareDirectoryEntry, ShareRootDescriptor, ShareRootId,
-    ShareServeError,
+    ShareServeError, ShareStageEntry, ShareTransferId, ShareTrashEntry,
 };
 use uc_core::ports::security::IdentityFingerprintFactoryPort;
 use uc_observability_contract::{
-    diagnostics::connectivity::InboundPeerProtocol, error_source::io_error_kind, uc_debug, uc_warn,
+    diagnostics::connectivity::{
+        record_remote_share_op, InboundPeerProtocol, RemoteShareDeny, RemoteShareOp,
+    },
+    error_source::io_error_kind,
+    uc_debug, uc_warn,
 };
 use uc_sync_protocol::remote_share::{
     self as share_wire, DenyCode, HelloState, ShareReply, ShareRequest, WireDirectoryEntry,
-    WireShareGrants, WireShareRoot,
+    WireShareGrants, WireShareRoot, WireStageEntry, WireTrashEntry,
 };
 
 use super::super::inbound_peer::InboundPeerGate;
@@ -152,7 +157,121 @@ impl IrohRemoteShareServeHandler {
                     },
                 }
             }
+            ShareRequest::Mkdir { root_id, path } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                ack_reply(self.state.serve.mkdir(peer, root, path).await)
+            }
+            ShareRequest::Rename { root_id, from, to } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                ack_reply(self.state.serve.rename(peer, root, from, to).await)
+            }
+            ShareRequest::Delete { root_id, path } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                match self.state.serve.delete(peer, root, path).await {
+                    Ok(trash_id) => ShareReply::Deleted { trash_id },
+                    Err(error) => ShareReply::Denied {
+                        code: serve_error_to_deny_code(error),
+                    },
+                }
+            }
+            ShareRequest::ListTrash {
+                root_id,
+                after,
+                limit,
+            } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                match self
+                    .state
+                    .serve
+                    .list_trash(peer, root, after.as_deref(), *limit)
+                    .await
+                {
+                    Ok(page) => ShareReply::TrashEntries {
+                        entries: page.entries.iter().map(trash_entry_to_wire).collect(),
+                        next_after: page.next_after.clone(),
+                    },
+                    Err(error) => ShareReply::Denied {
+                        code: serve_error_to_deny_code(error),
+                    },
+                }
+            }
+            ShareRequest::Restore {
+                root_id,
+                trash_id,
+                to,
+            } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                ack_reply(self.state.serve.restore(peer, root, trash_id, to).await)
+            }
+            ShareRequest::EmptyTrash { root_id } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                ack_reply(self.state.serve.empty_trash(peer, root).await)
+            }
+            ShareRequest::CopyWithin { root_id, from, to } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                ack_reply(self.state.serve.copy_within(peer, root, from, to).await)
+            }
+            ShareRequest::StageUpload {
+                root_id,
+                dir,
+                transfer_id,
+                entries,
+            } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                let entries: Vec<ShareStageEntry> =
+                    entries.iter().map(stage_entry_from_wire).collect();
+                match self
+                    .state
+                    .serve
+                    .stage_upload(
+                        peer,
+                        root,
+                        dir,
+                        &entries,
+                        ShareTransferId::from_bytes(*transfer_id),
+                    )
+                    .await
+                {
+                    Ok(outcome) => ShareReply::Staged {
+                        staging_id: outcome.staging_id,
+                    },
+                    Err(error) => ShareReply::Denied {
+                        code: serve_error_to_deny_code(error),
+                    },
+                }
+            }
+            ShareRequest::CommitUpload { staging_ids } => {
+                ack_reply(self.state.serve.commit_upload(peer, staging_ids).await)
+            }
+            ShareRequest::AbortUpload { staging_ids } => {
+                ack_reply(self.state.serve.abort_upload(peer, staging_ids).await)
+            }
+            ShareRequest::Export { root_id, path } => {
+                let root = ShareRootId::from_wire_bytes(*root_id);
+                match self.state.serve.export(peer, root, path).await {
+                    Ok(outcome) => ShareReply::Exported {
+                        ticket: outcome.ticket.as_bytes().to_vec(),
+                        size_bytes: outcome.size_bytes,
+                    },
+                    Err(error) => ShareReply::Denied {
+                        code: serve_error_to_deny_code(error),
+                    },
+                }
+            }
+            ShareRequest::Unknown { .. } => ShareReply::Denied {
+                code: DenyCode::UnsupportedRequest,
+            },
         }
+    }
+}
+
+/// Map a `Result<(), _>` serve call onto `Ack`/`Denied`.
+fn ack_reply(result: Result<(), ShareServeError>) -> ShareReply {
+    match result {
+        Ok(()) => ShareReply::Ack,
+        Err(error) => ShareReply::Denied {
+            code: serve_error_to_deny_code(error),
+        },
     }
 }
 
@@ -200,8 +319,12 @@ impl ProtocolHandler for IrohRemoteShareServeHandler {
             }
         };
 
-        // 4. Resolve through the serve port and map to a wire reply.
+        // 4. Resolve through the serve port and map to a wire reply, then write the
+        //    §5.3 audit trail: mutation/transfer ops become a peer-correlated
+        //    record (`peer_ref` assigned by the recording layer); read ops stay a
+        //    module-level debug line because directory browsing is high-frequency.
         let reply = self.serve_request(&peer, &request).await;
+        audit_served(remote_bytes, &request, &reply);
 
         // 5. Write the reply frame, then close the send half.
         if let Err(err) = share_wire::write_reply(&mut send, &reply).await {
@@ -224,6 +347,172 @@ impl ProtocolHandler for IrohRemoteShareServeHandler {
         //    so the QUIC teardown does not race its final read.
         let _ = tokio::time::timeout(CLOSE_BARRIER_TIMEOUT, connection.closed()).await;
         Ok(())
+    }
+}
+
+// ============================================================================
+// Audit (spec §5.3)
+// ============================================================================
+
+/// Write the audit trail for one served request. Mutation/transfer ops emit a
+/// peer-correlated record; the raw peer identity stays in-memory only — the
+/// recording layer turns it into an anonymous `peer_ref`. Read ops are
+/// high-frequency browse traffic and stay a `uc_debug!` line. Relative paths
+/// never leave the process: the record carries a truncated blake3 fingerprint
+/// (first 8 bytes, little-endian) which is enough to join audit lines about the
+/// same path without leaking its text.
+fn audit_served(peer: [u8; 32], request: &ShareRequest, reply: &ShareReply) {
+    let denied = match reply {
+        ShareReply::Denied { code } => Some(deny_code_to_audit(*code)),
+        _ => None,
+    };
+    match audit_subject(request) {
+        AuditSubject::Record {
+            op,
+            root_id,
+            rel_fingerprint,
+        } => record_remote_share_op(peer, op, root_id, rel_fingerprint, denied),
+        AuditSubject::Read { op } => match denied {
+            Some(deny) => uc_debug!(
+                op = op,
+                reason = deny_name(deny),
+                "remote-share serve: request denied"
+            ),
+            None => uc_debug!(op = op, "remote-share serve: request served"),
+        },
+    }
+}
+
+/// Whether a request becomes an audit record or a debug line.
+enum AuditSubject {
+    Record {
+        op: RemoteShareOp,
+        root_id: Option<[u8; 16]>,
+        rel_fingerprint: Option<u64>,
+    },
+    Read {
+        op: &'static str,
+    },
+}
+
+fn audit_subject(request: &ShareRequest) -> AuditSubject {
+    use RemoteShareOp as Op;
+    match request {
+        ShareRequest::Hello => AuditSubject::Read { op: "hello" },
+        ShareRequest::ListRoots => AuditSubject::Read { op: "list_roots" },
+        ShareRequest::List { .. } => AuditSubject::Read { op: "list" },
+        ShareRequest::Stat { .. } => AuditSubject::Read { op: "stat" },
+        ShareRequest::ListTrash { .. } => AuditSubject::Read { op: "list_trash" },
+        ShareRequest::Mkdir { root_id, path } => AuditSubject::Record {
+            op: Op::Mkdir,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(path)),
+        },
+        ShareRequest::Rename { root_id, from, .. } => AuditSubject::Record {
+            op: Op::Rename,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(from)),
+        },
+        ShareRequest::Delete { root_id, path } => AuditSubject::Record {
+            op: Op::Delete,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(path)),
+        },
+        ShareRequest::Restore { root_id, to, .. } => AuditSubject::Record {
+            op: Op::Restore,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(to)),
+        },
+        ShareRequest::EmptyTrash { root_id } => AuditSubject::Record {
+            op: Op::EmptyTrash,
+            root_id: Some(*root_id),
+            rel_fingerprint: None,
+        },
+        ShareRequest::CopyWithin { root_id, from, .. } => AuditSubject::Record {
+            op: Op::CopyWithin,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(from)),
+        },
+        ShareRequest::StageUpload { root_id, dir, .. } => AuditSubject::Record {
+            op: Op::StageUpload,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(dir)),
+        },
+        ShareRequest::CommitUpload { .. } => AuditSubject::Record {
+            op: Op::CommitUpload,
+            root_id: None,
+            rel_fingerprint: None,
+        },
+        ShareRequest::AbortUpload { .. } => AuditSubject::Record {
+            op: Op::AbortUpload,
+            root_id: None,
+            rel_fingerprint: None,
+        },
+        ShareRequest::Export { root_id, path } => AuditSubject::Record {
+            op: Op::Export,
+            root_id: Some(*root_id),
+            rel_fingerprint: Some(rel_fingerprint(path)),
+        },
+        ShareRequest::Unknown { .. } => AuditSubject::Record {
+            op: Op::Unknown,
+            root_id: None,
+            rel_fingerprint: None,
+        },
+    }
+}
+
+/// blake3(rel) truncated to 8 bytes — joins audit lines about the same path
+/// without exposing its text (spec §5.3).
+fn rel_fingerprint(rel: &str) -> u64 {
+    let digest = blake3::hash(rel.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Wire deny code → audit enum (same names, contract-crate local copy so the
+/// record schema stays independent of the wire crate).
+fn deny_code_to_audit(code: DenyCode) -> RemoteShareDeny {
+    match code {
+        DenyCode::Locked => RemoteShareDeny::Locked,
+        DenyCode::Unsupported => RemoteShareDeny::Unsupported,
+        DenyCode::UnsupportedRequest => RemoteShareDeny::UnsupportedRequest,
+        DenyCode::Suspended => RemoteShareDeny::Suspended,
+        DenyCode::Revoked => RemoteShareDeny::Revoked,
+        DenyCode::Denied => RemoteShareDeny::Denied,
+        DenyCode::ReservedName => RemoteShareDeny::ReservedName,
+        DenyCode::NotFound => RemoteShareDeny::NotFound,
+        DenyCode::Conflict => RemoteShareDeny::Conflict,
+        DenyCode::RootGone => RemoteShareDeny::RootGone,
+        DenyCode::Quota => RemoteShareDeny::Quota,
+        DenyCode::TooLarge => RemoteShareDeny::TooLarge,
+        DenyCode::TooManyEntries => RemoteShareDeny::TooManyEntries,
+        DenyCode::Io => RemoteShareDeny::Io,
+        DenyCode::Cancelled => RemoteShareDeny::Cancelled,
+        DenyCode::TooLate => RemoteShareDeny::TooLate,
+        DenyCode::Interrupted => RemoteShareDeny::Interrupted,
+    }
+}
+
+fn deny_name(deny: RemoteShareDeny) -> &'static str {
+    match deny {
+        RemoteShareDeny::Locked => "locked",
+        RemoteShareDeny::Unsupported => "unsupported",
+        RemoteShareDeny::UnsupportedRequest => "unsupported_request",
+        RemoteShareDeny::Suspended => "suspended",
+        RemoteShareDeny::Revoked => "revoked",
+        RemoteShareDeny::Denied => "denied",
+        RemoteShareDeny::ReservedName => "reserved_name",
+        RemoteShareDeny::NotFound => "not_found",
+        RemoteShareDeny::Conflict => "conflict",
+        RemoteShareDeny::RootGone => "root_gone",
+        RemoteShareDeny::Quota => "quota",
+        RemoteShareDeny::TooLarge => "too_large",
+        RemoteShareDeny::TooManyEntries => "too_many_entries",
+        RemoteShareDeny::Io => "io",
+        RemoteShareDeny::Cancelled => "cancelled",
+        RemoteShareDeny::TooLate => "too_late",
+        RemoteShareDeny::Interrupted => "interrupted",
     }
 }
 
@@ -257,24 +546,57 @@ fn entry_to_wire(entry: &ShareDirectoryEntry) -> WireDirectoryEntry {
     WireDirectoryEntry {
         name: entry.name.clone(),
         is_dir: entry.is_dir,
+        is_symlink: entry.is_symlink,
         size_bytes: entry.size_bytes,
         modified_at_ms: entry.modified_at_ms,
     }
 }
 
-/// Map a serve error onto the wire denial code. The mapping is total: the only
-/// non-1:1 case is `RootGone` (an authorized-but-unregistered root), which has no
-/// distinct wire code and surfaces as `NotFound`.
+/// Map a domain trash entry onto its wire DTO.
+fn trash_entry_to_wire(entry: &ShareTrashEntry) -> WireTrashEntry {
+    WireTrashEntry {
+        trash_id: entry.trash_id.clone(),
+        original_path: entry.original_rel.clone(),
+        is_dir: entry.is_dir,
+        size_bytes: entry.size_bytes,
+        deleted_at_ms: entry.deleted_at_ms,
+    }
+}
+
+/// Map a wire stage entry onto its domain shape. An empty `ticket` means a
+/// directory entry (no bytes to pull); a non-empty one is opaque bytes the
+/// blob layer interprets — never decoded or logged here.
+fn stage_entry_from_wire(entry: &WireStageEntry) -> ShareStageEntry {
+    ShareStageEntry {
+        rel: entry.rel.clone(),
+        is_dir: entry.is_dir,
+        size_bytes: entry.size_bytes,
+        ticket: if entry.ticket.is_empty() {
+            None
+        } else {
+            Some(BlobTicket::from_bytes(entry.ticket.clone()))
+        },
+    }
+}
+
+/// Map a serve error onto the wire denial code. The mapping is total; the two
+/// deliberate collapses are `StagingNotFound` (an unknown or foreign staging
+/// id) which surfaces as `NotFound` (fail-closed, opaque), and the two
+/// type-mismatch variants (`IsADirectory`/`NotADirectory`) which have no
+/// dedicated wire code and surface as `Denied`.
 fn serve_error_to_deny_code(error: ShareServeError) -> DenyCode {
     match error {
-        ShareServeError::NotUnlocked => DenyCode::NotUnlocked,
-        ShareServeError::NotAuthorized => DenyCode::NotAuthorized,
-        ShareServeError::NotFound => DenyCode::NotFound,
-        ShareServeError::IsADirectory => DenyCode::IsADirectory,
-        ShareServeError::NotADirectory => DenyCode::NotADirectory,
+        ShareServeError::NotUnlocked => DenyCode::Locked,
+        ShareServeError::NotAuthorized => DenyCode::Denied,
+        ShareServeError::NotFound | ShareServeError::StagingNotFound => DenyCode::NotFound,
+        ShareServeError::IsADirectory | ShareServeError::NotADirectory => DenyCode::Denied,
         ShareServeError::ReservedName => DenyCode::ReservedName,
         ShareServeError::Suspended => DenyCode::Suspended,
-        ShareServeError::RootGone => DenyCode::NotFound,
+        ShareServeError::Conflict => DenyCode::Conflict,
+        ShareServeError::RootGone => DenyCode::RootGone,
+        ShareServeError::UnsupportedRequest => DenyCode::UnsupportedRequest,
+        ShareServeError::TooLarge => DenyCode::TooLarge,
+        ShareServeError::TooLate => DenyCode::TooLate,
         ShareServeError::Io => DenyCode::Io,
     }
 }
@@ -299,7 +621,10 @@ mod tests {
     use tokio::sync::Mutex;
 
     use uc_core::membership::{MembershipError, SpaceMember};
-    use uc_core::ports::remote_share::{ShareDirectoryPage, ShareGrants};
+    use uc_core::ports::remote_share::{
+        ShareDirectoryPage, ShareExportOutcome, ShareGrants, ShareStageEntry, ShareStageOutcome,
+        ShareTrashPage,
+    };
     use uc_core::MemberSyncPreferences;
 
     use uc_infra_crypto::identity_fingerprint::Sha256IdentityFingerprintFactory;
@@ -403,8 +728,108 @@ mod tests {
             Ok(ShareDirectoryEntry {
                 name: "note.txt".to_owned(),
                 is_dir: false,
+                is_symlink: false,
                 size_bytes: 42,
                 modified_at_ms: 1_700_000_000_000,
+            })
+        }
+        async fn mkdir(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _rel: &str,
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn rename(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _from: &str,
+            _to: &str,
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn delete(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _rel: &str,
+        ) -> Result<String, ShareServeError> {
+            Ok("stub-trash".to_owned())
+        }
+        async fn copy_within(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _from: &str,
+            _to: &str,
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn list_trash(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _after: Option<&str>,
+            _limit: u32,
+        ) -> Result<ShareTrashPage, ShareServeError> {
+            Ok(ShareTrashPage {
+                entries: Vec::new(),
+                next_after: None,
+            })
+        }
+        async fn restore(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _trash_id: &str,
+            _to: &str,
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn empty_trash(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn stage_upload(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _dir: &str,
+            _entries: &[ShareStageEntry],
+            _transfer_id: ShareTransferId,
+        ) -> Result<ShareStageOutcome, ShareServeError> {
+            Ok(ShareStageOutcome {
+                staging_id: "stub-staging".to_owned(),
+            })
+        }
+        async fn commit_upload(
+            &self,
+            _peer: &DeviceId,
+            _staging_ids: &[String],
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn abort_upload(
+            &self,
+            _peer: &DeviceId,
+            _staging_ids: &[String],
+        ) -> Result<(), ShareServeError> {
+            Ok(())
+        }
+        async fn export(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _rel: &str,
+        ) -> Result<ShareExportOutcome, ShareServeError> {
+            Ok(ShareExportOutcome {
+                ticket: BlobTicket::from_bytes(vec![0xAA, 0xBB]),
+                size_bytes: 7,
             })
         }
     }
@@ -438,6 +863,97 @@ mod tests {
             _root: ShareRootId,
             _rel: &str,
         ) -> Result<ShareDirectoryEntry, ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn mkdir(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _rel: &str,
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn rename(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _from: &str,
+            _to: &str,
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn delete(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _rel: &str,
+        ) -> Result<String, ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn copy_within(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _from: &str,
+            _to: &str,
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn list_trash(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _after: Option<&str>,
+            _limit: u32,
+        ) -> Result<ShareTrashPage, ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn restore(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _trash_id: &str,
+            _to: &str,
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn empty_trash(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn stage_upload(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _dir: &str,
+            _entries: &[ShareStageEntry],
+            _transfer_id: ShareTransferId,
+        ) -> Result<ShareStageOutcome, ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn commit_upload(
+            &self,
+            _peer: &DeviceId,
+            _staging_ids: &[String],
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn abort_upload(
+            &self,
+            _peer: &DeviceId,
+            _staging_ids: &[String],
+        ) -> Result<(), ShareServeError> {
+            panic!("serve reached past the admission gate")
+        }
+        async fn export(
+            &self,
+            _peer: &DeviceId,
+            _root: ShareRootId,
+            _rel: &str,
+        ) -> Result<ShareExportOutcome, ShareServeError> {
             panic!("serve reached past the admission gate")
         }
     }
@@ -617,6 +1133,7 @@ mod tests {
         serve.entries.lock().await.push(ShareDirectoryEntry {
             name: "a.txt".to_owned(),
             is_dir: false,
+            is_symlink: false,
             size_bytes: 7,
             modified_at_ms: 123,
         });
@@ -696,11 +1213,11 @@ mod tests {
         router.shutdown().await.ok();
     }
 
-    /// Verdict 5 — a serve error maps to the right wire denial code (here `RootGone`
-    /// → `NotFound`), and a locked holder's `list_roots` → `NotUnlocked`.
+    /// Verdict 5 — a serve error maps to its wire denial code (`RootGone`
+    /// surfaces as `RootGone` now that the wire carries the full spec §12 set).
     #[tokio::test]
     async fn serve_errors_map_to_deny_codes() {
-        // RootGone → NotFound on a List.
+        // RootGone → RootGone on a List.
         struct RootGoneServe;
         #[async_trait]
         impl RemoteShareServePort for RootGoneServe {
@@ -729,6 +1246,97 @@ mod tests {
                 _root: ShareRootId,
                 _rel: &str,
             ) -> Result<ShareDirectoryEntry, ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn mkdir(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _rel: &str,
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn rename(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _from: &str,
+                _to: &str,
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn delete(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _rel: &str,
+            ) -> Result<String, ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn copy_within(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _from: &str,
+                _to: &str,
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn list_trash(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _after: Option<&str>,
+                _limit: u32,
+            ) -> Result<ShareTrashPage, ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn restore(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _trash_id: &str,
+                _to: &str,
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn empty_trash(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn stage_upload(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _dir: &str,
+                _entries: &[ShareStageEntry],
+                _transfer_id: ShareTransferId,
+            ) -> Result<ShareStageOutcome, ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn commit_upload(
+                &self,
+                _peer: &DeviceId,
+                _staging_ids: &[String],
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn abort_upload(
+                &self,
+                _peer: &DeviceId,
+                _staging_ids: &[String],
+            ) -> Result<(), ShareServeError> {
+                Err(ShareServeError::RootGone)
+            }
+            async fn export(
+                &self,
+                _peer: &DeviceId,
+                _root: ShareRootId,
+                _rel: &str,
+            ) -> Result<ShareExportOutcome, ShareServeError> {
                 Err(ShareServeError::RootGone)
             }
         }
@@ -763,7 +1371,101 @@ mod tests {
         assert_eq!(
             reply,
             ShareReply::Denied {
-                code: DenyCode::NotFound
+                code: DenyCode::RootGone
+            }
+        );
+
+        router.shutdown().await.ok();
+    }
+
+    /// Verdict 6 — mutation ops round-trip over the wire: `Mkdir` answers
+    /// `Ack`, `Delete` answers `Deleted` with the stub's `trash_id`.
+    #[tokio::test]
+    async fn member_mutations_are_served() {
+        let sender_seed = [0xBBu8; 32];
+        let receiver_seed = [0xCCu8; 32];
+        let member_repo: Arc<dyn MemberRepositoryPort> = Arc::new(MemMemberRepo::default());
+        member_repo
+            .save(&make_member(sender_seed, "member-a"))
+            .await
+            .unwrap();
+
+        let serve = StubServe::new();
+        let (endpoint, router) = spawn_serve(
+            receiver_seed,
+            Arc::clone(&member_repo),
+            Arc::clone(&serve) as _,
+        )
+        .await;
+
+        let rid = root_id().as_bytes();
+        let mkdir_reply = share_request(
+            sender_seed,
+            endpoint.addr(),
+            &ShareRequest::Mkdir {
+                root_id: rid,
+                path: "new/dir".to_owned(),
+            },
+        )
+        .await
+        .expect("mkdir reply decodes");
+        assert_eq!(mkdir_reply, ShareReply::Ack);
+
+        let delete_reply = share_request(
+            sender_seed,
+            endpoint.addr(),
+            &ShareRequest::Delete {
+                root_id: rid,
+                path: "gone.txt".to_owned(),
+            },
+        )
+        .await
+        .expect("delete reply decodes");
+        assert_eq!(
+            delete_reply,
+            ShareReply::Deleted {
+                trash_id: "stub-trash".to_owned()
+            }
+        );
+
+        router.shutdown().await.ok();
+    }
+
+    /// Verdict 7 — `Export` round-trips: the holder's ticket + size answer
+    /// decodes as `Exported` (P4).
+    #[tokio::test]
+    async fn export_is_served_with_ticket() {
+        let sender_seed = [0xDDu8; 32];
+        let receiver_seed = [0xEEu8; 32];
+        let member_repo: Arc<dyn MemberRepositoryPort> = Arc::new(MemMemberRepo::default());
+        member_repo
+            .save(&make_member(sender_seed, "member-a"))
+            .await
+            .unwrap();
+
+        let serve = StubServe::new();
+        let (endpoint, router) = spawn_serve(
+            receiver_seed,
+            Arc::clone(&member_repo),
+            Arc::clone(&serve) as _,
+        )
+        .await;
+
+        let reply = share_request(
+            sender_seed,
+            endpoint.addr(),
+            &ShareRequest::Export {
+                root_id: root_id().as_bytes(),
+                path: "out.bin".to_owned(),
+            },
+        )
+        .await
+        .expect("export reply decodes");
+        assert_eq!(
+            reply,
+            ShareReply::Exported {
+                ticket: vec![0xAA, 0xBB],
+                size_bytes: 7
             }
         );
 
