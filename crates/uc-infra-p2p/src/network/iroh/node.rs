@@ -61,7 +61,7 @@ use uc_core::ports::blob::BlobTransferPort;
 use uc_core::ports::pairing_invitation::{
     PairingInvitationAddressQueryPort, PairingInvitationByAddressPort, PairingInvitationPort,
 };
-use uc_core::ports::remote_share::RemoteShareServePort;
+use uc_core::ports::remote_share::{RemoteShareClientPort, RemoteShareServePort};
 use uc_core::ports::security::IdentityFingerprintFactoryPort;
 use uc_core::ports::{
     ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardPullServePort,
@@ -100,7 +100,9 @@ use super::network_partition::IrohNetworkPartitionGate;
 use super::peer_reachability_adapter::{
     IrohPeerReachabilityAdapter, LEGACY_PEER_REACHABILITY_ALPN, PEER_REACHABILITY_ALPN,
 };
-use super::remote_share::{IrohRemoteShareServeAdapter, REMOTE_SHARE_ALPN};
+use super::remote_share::{
+    IrohRemoteShareClientAdapter, IrohRemoteShareServeAdapter, REMOTE_SHARE_ALPN,
+};
 use super::space_admission::{
     IrohSpaceAdmissionHandler, IrohSpaceAdmissionTransport, SpaceAdmissionChannelCredentialPort,
     SPACE_ADMISSION_ALPN,
@@ -167,6 +169,17 @@ pub struct ActiveClipboardHandlers {
 /// has no outbound surface.
 pub struct ActiveClipboardPullHandlers {
     pub client: Arc<dyn ActiveClipboardPullClientPort>,
+}
+
+/// The remote-share ports produced by
+/// [`IrohSessionBuilder::install_remote_share`].
+///
+/// `client` dials a peer on `remote-share/1` and issues the requester-side
+/// ops (browse / mutation / staged upload / export); the serve handler is
+/// registered under the same ALPN on the `RouterBuilder`. Only the client
+/// port is returned — the serve side has no outbound surface.
+pub struct RemoteShareHandlers {
+    pub client: Arc<dyn RemoteShareClientPort>,
 }
 
 /// [`IrohSessionBuilder::install_blobs`] 产出的 blob port。
@@ -1358,24 +1371,26 @@ impl IrohSessionBuilder {
         Ok(ActiveClipboardPullHandlers { client })
     }
 
-    /// 安装 `remote-share/1` 控制面的 holder 侧 handler。
+    /// 安装 `remote-share/1` 控制面（holder 侧 handler + 出站 client）。
     ///
     /// 注册 [`REMOTE_SHARE_ALPN`]：serve handler 先经 [`InboundPeerGate`] 放行对端，再把
     /// 每个请求交给应用层 [`RemoteShareServePort`]（authorize + confine + read）解析，
-    /// 只回元数据（授权根清单 / 目录分页 / 单条元数据）或类型化拒绝，不传字节。
+    /// 只回元数据或类型化拒绝，不传字节。
     ///
-    /// 本轮没有出站 client：请求方是 dial 本 ALPN 的对端，holder 的回复就是控制面。
-    /// 出站 dial 端口（列某台远程设备的目录树）随 P5 的 daemon 路由一起加。
+    /// 返回 [`RemoteShareHandlers`]：`client` 是出站 dial 端口
+    /// （`RemoteShareClientPort`），由 Application 层编排浏览 / 变更 /
+    /// 两阶段上传 / 导出拉取；daemon 路由在 P5 后半接入。
     ///
     /// 必须在 [`spawn`](Self::spawn) 之前调用，并复用 `identities` /
     /// `fingerprint_factory` 做对端身份验证（同 `install_clipboard`）。
     pub fn install_remote_share(
         &mut self,
+        peer_addr_repo: Arc<dyn PeerAddressRepositoryPort>,
         identities: Arc<dyn PeerIdentityDirectoryPort>,
         peer_admission: Arc<dyn PeerAdmissionPort>,
         fingerprint_factory: Arc<dyn IdentityFingerprintFactoryPort>,
         serve: Arc<dyn RemoteShareServePort>,
-    ) -> Result<(), IrohNodeError> {
+    ) -> Result<RemoteShareHandlers, IrohNodeError> {
         let serve_adapter = IrohRemoteShareServeAdapter::new(
             identities,
             peer_admission,
@@ -1385,7 +1400,13 @@ impl IrohSessionBuilder {
         let handler = serve_adapter.handler();
 
         self.install_session_handler([REMOTE_SHARE_ALPN], handler)?;
-        Ok(())
+
+        let client = Arc::new(IrohRemoteShareClientAdapter::new(
+            Arc::clone(&self.context.endpoint),
+            peer_addr_repo,
+        ));
+
+        Ok(RemoteShareHandlers { client })
     }
 
     /// 安装"反向传输进度"通道(receiver → sender)。

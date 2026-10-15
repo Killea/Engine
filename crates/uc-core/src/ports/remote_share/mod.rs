@@ -1,10 +1,12 @@
 //! 设备文件共享的领域类型与端口。
 
+mod client;
 mod confinement;
 mod model;
 mod serve;
 mod store;
 
+pub use client::{RemoteShareClientError, RemoteShareClientPort, ShareClientDeny};
 pub use confinement::{
     is_well_formed_relative, ConfineError, ConfinedDirEntry, ConfinedMetadata, ConfinedTarget,
     ConfinedTargetToken, ConfinedTrashEntry, ConfinedTrashPage, ConflictPolicy, RootIdentity,

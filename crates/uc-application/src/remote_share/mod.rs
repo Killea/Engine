@@ -6,12 +6,17 @@
 //! cap-std 路径约束两个事实合取，成功后才以环境权限读取元数据。
 
 pub(crate) mod authorizer;
+pub(crate) mod client;
 pub(crate) mod facade;
 pub(crate) mod registry;
 pub(crate) mod serve_handler;
 pub(crate) mod transfer;
 
 pub use authorizer::SharePermit;
+pub use client::{
+    RemoteShareClient, RemoteShareClientDeps, ShareOutboundError, ShareUploadItem,
+    ShareUploadReport, ShareUploadSource,
+};
 pub use facade::{RemoteShareFacade, RemoteShareFacadeDeps};
 pub use registry::{ReconcileReport, ShareRootsRegistry};
 pub use serve_handler::{RemoteShareServe, RemoteShareServeDeps};

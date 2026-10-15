@@ -28,7 +28,10 @@ use uc_application::deps::{
     SpaceRuntimeAdapters,
 };
 use uc_application::facade::{
-    remote_share::{RemoteShareServe, RemoteShareServeDeps, ShareRootsRegistry},
+    remote_share::{
+        RemoteShareClient, RemoteShareClientDeps, RemoteShareServe, RemoteShareServeDeps,
+        ShareRootsRegistry,
+    },
     ApplicationAssembly,
 };
 use uc_core::file_transfer::FileTransferCancellationReason;
@@ -43,7 +46,7 @@ use uc_infra_local::fs::{
 use uc_infra_p2p::network::iroh::{
     encode_space_admission_route, ActiveClipboardHandlers, ActiveClipboardPullHandlers,
     BlobHandlers, ClipboardHandlers, GroupUpdateHandlers, IrohIdentityStore, IrohNodeError,
-    IrohSessionBuilder, PreparedIrohSession, TransferProgressHandlers,
+    IrohSessionBuilder, PreparedIrohSession, RemoteShareHandlers, TransferProgressHandlers,
 };
 use uc_infra_profile::security::Sha256IdentityFingerprintFactory;
 use uc_infra_profile::space::{
@@ -105,6 +108,9 @@ pub struct SyncSessionAssembly {
     /// 共享根清单 ↔ 约束登记表的收敛责任人。会话级持有：登记表随会话
     /// 存废，分享/撤销/挂起写路径经此句柄收敛。
     pub remote_share_registry: Arc<ShareRootsRegistry>,
+    /// 对 peer 发起 remote-share 请求的流程负责人（浏览 / 变更 / 上传 /
+    /// 下载编排）。会话级持有：出站拨号复用会话 endpoint 与地址簿。
+    pub remote_share_client: Arc<RemoteShareClient>,
 }
 
 /// Engine 完成网络装配后一次性交给 Application 的被动 adapter 集合。
@@ -130,8 +136,10 @@ impl SyncSessionAssembly {
         _deadline: Option<Instant>,
     ) -> Result<(), LifecycleError> {
         // 会话收口先撤共享根登记：约束登记表存活得比 serve 路由久，不撤会
-        // 让已下线会话继续占着用户目录句柄。
+        // 让已下线会话继续占着用户目录句柄。随后清算在途上传的 blob 暂挂
+        // 租约——任务随会话死亡时它们不会再走到 commit/abort 的 untag。
         self.remote_share_registry.revoke_all().await;
+        self.remote_share_client.release_inflight().await;
         let mut errors = Vec::new();
         if let Err(error) = self
             .outbound_progress_translator
@@ -544,8 +552,14 @@ pub async fn prepare_sync_session(
     // metadata ops + staging/commit/abort + export). The serve port enforces
     // the authorize→confine→read AND (fail-closed) per request; bulk bytes
     // move as blobs through `blob_transfer`, and pull progress rides the
-    // transfer-progress back-channel under the client's transfer_id.
-    builder.install_remote_share(
+    // transfer-progress back-channel under the client's transfer_id. The
+    // returned client port is the requester side of the same ALPN; the
+    // application-level RemoteShareClient wraps it into complete
+    // upload/download/browse flows.
+    let RemoteShareHandlers {
+        client: remote_share_client_port,
+    } = builder.install_remote_share(
+        Arc::clone(&space_setup.peer_addr_repo),
         Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
         Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
         Arc::clone(&space_setup.fingerprint),
@@ -568,6 +582,14 @@ pub async fn prepare_sync_session(
     ));
     share_roots.reconcile_startup().await;
 
+    // 出站侧负责人：browse/mutation 直通 + upload/download 编排（本机
+    // blob 发布签票、分片 stage、commit/abort、导出拉取）。会话级句柄，
+    // daemon 路由接入时经此消费。
+    let remote_share_client = Arc::new(RemoteShareClient::new(RemoteShareClientDeps {
+        client: remote_share_client_port,
+        blobs: Arc::clone(&blob_transfer),
+    }));
+
     let prepared_session = builder.finish();
 
     // Translator worker:从 sender 端的反向通道收 InboundProgressEvent,
@@ -584,6 +606,7 @@ pub async fn prepare_sync_session(
         session: SyncSessionAssembly {
             outbound_progress_translator,
             remote_share_registry: share_roots,
+            remote_share_client,
         },
         application: SyncApplicationAdapters {
             binding: application_network,

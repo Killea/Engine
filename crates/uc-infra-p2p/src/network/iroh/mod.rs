@@ -75,7 +75,7 @@ pub use node::{
     ActiveClipboardHandlers, ActiveClipboardPullHandlers, BlobHandlers, ClipboardHandlers,
     GroupUpdateHandlers, IrohNode, IrohNodeBuilder, IrohNodeConfig, IrohNodeError,
     IrohNodeShutdownError, IrohRelayAccessToken, IrohSessionBuilder, PairingInvitationHandlers,
-    PreparedIrohSession, TransferProgressHandlers,
+    PreparedIrohSession, RemoteShareHandlers, TransferProgressHandlers,
 };
 pub use peer_reachability_adapter::{
     IrohPeerReachabilityAdapter, IrohPeerReachabilityHandler, LEGACY_PEER_REACHABILITY_ALPN,
