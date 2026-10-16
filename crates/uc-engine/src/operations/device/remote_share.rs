@@ -13,7 +13,7 @@ use uc_application::facade::remote_share::{
 use uc_core::ids::DeviceId;
 use uc_core::ports::remote_share::{
     RemoteShareClientError, ShareAvailability, ShareClientDeny, ShareGrants, ShareRoot,
-    ShareRootId, ShareStoreDoc, ShareTransferId,
+    ShareRootId, ShareStoreDoc, ShareTransferId, SharedRootStoreError,
 };
 use uc_observability_contract::{error_source::io_error_kind, uc_error};
 
@@ -24,7 +24,7 @@ use crate::error_codes::{
     PEER_SHARE_RESERVED_NAME_CODE, PEER_SHARE_REVOKED_CODE, PEER_SHARE_ROOT_GONE_CODE,
     PEER_SHARE_SUSPENDED_CODE, PEER_SHARE_TOO_LARGE_CODE, PEER_SHARE_TOO_LATE_CODE,
     PEER_SHARE_TOO_MANY_ENTRIES_CODE, PEER_SHARE_UNAVAILABLE_CODE, PEER_SHARE_UNSUPPORTED_CODE,
-    PEER_SHARE_UNSUPPORTED_REQUEST_CODE, REMOTE_SHARE_STATE_FAILED_CODE,
+    PEER_SHARE_UNSUPPORTED_REQUEST_CODE, REMOTE_SHARE_LOCKED_CODE, REMOTE_SHARE_STATE_FAILED_CODE,
 };
 use crate::{
     CancelPeerShareTransferInput, DownloadPeerShareInput, EngineError, EngineErrorCategory,
@@ -212,17 +212,24 @@ fn map_outbound_error(error: ShareOutboundError) -> EngineError {
     }
 }
 
-fn map_store_error(error: impl std::error::Error + Send + Sync + 'static) -> EngineError {
+fn map_store_error(error: SharedRootStoreError) -> EngineError {
+    let (code, category) = match &error {
+        // Space 未解锁不是存储故障：单独成码，daemon 据此译为
+        // `423 session_locked` / `GET state` 的 `locked` 形态。
+        SharedRootStoreError::NotUnlocked => {
+            (REMOTE_SHARE_LOCKED_CODE, EngineErrorCategory::Unavailable)
+        }
+        _ => (
+            REMOTE_SHARE_STATE_FAILED_CODE,
+            EngineErrorCategory::Internal,
+        ),
+    };
     uc_error!(
         error_kind = "remote_share_store",
         io_error_kind = io_error_kind(&error),
         "remote share root store failed"
     );
-    EngineError::new(
-        REMOTE_SHARE_STATE_FAILED_CODE,
-        EngineErrorCategory::Internal,
-        false,
-    )
+    EngineError::new(code, category, false)
 }
 
 fn reconcile_summary(report: ReconcileReport) -> RemoteShareReconcileSummary {
@@ -859,6 +866,7 @@ mod tests {
     struct StubStore {
         doc: Mutex<ShareStoreDoc>,
         fail_load: AtomicBool,
+        fail_load_io: AtomicBool,
         saves: AtomicUsize,
     }
 
@@ -867,6 +875,11 @@ mod tests {
         async fn load(&self) -> Result<ShareStoreDoc, SharedRootStoreError> {
             if self.fail_load.load(Ordering::Relaxed) {
                 return Err(SharedRootStoreError::NotUnlocked);
+            }
+            if self.fail_load_io.load(Ordering::Relaxed) {
+                return Err(SharedRootStoreError::Io {
+                    source: std::io::Error::new(std::io::ErrorKind::Other, "disk gone"),
+                });
             }
             // discarded-source[lock-poisoned]: `PoisonError`: test-only stub.
             Ok(self.doc.lock().expect("doc").clone())
@@ -1006,6 +1019,7 @@ mod tests {
             Arc::new(StubStore {
                 doc: Mutex::new(doc),
                 fail_load: AtomicBool::new(false),
+                fail_load_io: AtomicBool::new(false),
                 saves: AtomicUsize::new(0),
             }),
             Arc::new(StubConfinement::default()),
@@ -1140,10 +1154,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_state_store_failure_maps_to_stable_code() {
+    async fn query_state_locked_maps_to_locked_code() {
         let store = Arc::new(StubStore {
             doc: Mutex::new(ShareStoreDoc::default()),
             fail_load: AtomicBool::new(true),
+            fail_load_io: AtomicBool::new(false),
             saves: AtomicUsize::new(0),
         });
         let registry = Arc::new(ShareRootsRegistry::new(
@@ -1152,7 +1167,26 @@ mod tests {
         ));
         let error = execute_query_remote_share_state(registry)
             .await
-            .expect_err("load failure must surface");
+            .expect_err("locked store must surface");
+        assert_eq!(error.code(), REMOTE_SHARE_LOCKED_CODE);
+        assert_eq!(error.category(), EngineErrorCategory::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn query_state_store_io_maps_to_failed_code() {
+        let store = Arc::new(StubStore {
+            doc: Mutex::new(ShareStoreDoc::default()),
+            fail_load: AtomicBool::new(false),
+            fail_load_io: AtomicBool::new(true),
+            saves: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(ShareRootsRegistry::new(
+            store,
+            Arc::new(StubConfinement::default()),
+        ));
+        let error = execute_query_remote_share_state(registry)
+            .await
+            .expect_err("io failure must surface");
         assert_eq!(error.code(), REMOTE_SHARE_STATE_FAILED_CODE);
         assert_eq!(error.category(), EngineErrorCategory::Internal);
     }

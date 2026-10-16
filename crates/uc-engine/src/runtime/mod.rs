@@ -37,7 +37,10 @@ use crate::assembly::mobile_lan::MobileLanEndpointUpdater;
 #[cfg(feature = "dev-tools")]
 use crate::dev::JoinerFinalConfirmationGate;
 use crate::engine::event_stream::EventSender;
-use crate::error_codes::{PROFILE_RECOVERY_REQUIRED_CODE, PROFILE_UPGRADE_BACKUP_KEY_MISSING_CODE};
+use crate::error_codes::{
+    OPERATION_UNAVAILABLE_CODE, PROFILE_RECOVERY_REQUIRED_CODE,
+    PROFILE_UPGRADE_BACKUP_KEY_MISSING_CODE,
+};
 use crate::{
     AdmissionRecoverySummary, EngineConfig, EngineError, EngineErrorCategory, EngineEvent,
     HostCapabilities, HostFileAccess, NetworkRecoveryPhaseSummary, NetworkRecoveryStatusSummary,
@@ -47,7 +50,6 @@ use host_clipboard::{spawn_host_clipboard_change_task, HostClipboardChangeRuntim
 pub(crate) use profile_recovery::RecoverableRuntime;
 use session_supervisor::{lifecycle_error, SessionSupervisor};
 const START_FAILED_CODE: u32 = 1101;
-const OPERATION_UNAVAILABLE_CODE: u32 = 1103;
 
 pub(crate) struct ProductionRuntime {
     app_version: String,

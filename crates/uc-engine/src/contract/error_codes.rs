@@ -201,8 +201,15 @@ pub const PEER_SHARE_INTERRUPTED_CODE: u32 = 2117;
 pub const PEER_SHARE_UNAVAILABLE_CODE: u32 = 2118;
 /// 协议违例 / 本地编排失败。
 pub const PEER_SHARE_FAILED_CODE: u32 = 2119;
-/// 本机共享清单读写失败。
+/// 本机共享清单读写失败（IO/损坏/超限）。
 pub const REMOTE_SHARE_STATE_FAILED_CODE: u32 = 2120;
+/// 清单因 Space 未解锁而不可读（daemon 译为 `423 session_locked`，
+/// `GET /remote-share/state` 译为本机 `locked` 形态）。
+pub const REMOTE_SHARE_LOCKED_CODE: u32 = 2121;
+
+/// 会话未建立（Space 未解锁）时全部 remote-share 操作返回的稳定码，
+/// daemon 统一译为 `423 session_locked`。
+pub const OPERATION_UNAVAILABLE_CODE: u32 = 1103;
 
 #[cfg(test)]
 mod tests {
