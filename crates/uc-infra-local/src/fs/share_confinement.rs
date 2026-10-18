@@ -311,35 +311,51 @@ fn now_ms() -> i64 {
     mtime_ms(Some(SystemTime::now()))
 }
 
-/// 从 `std::fs` 元数据取文件系统身份（dev/ino；Windows 上为卷序列号 + file index）。
+/// 从 `std::fs` 元数据取文件系统身份（dev/ino；Windows 上为卷前缀哈希 +
+/// file index）。`path` 是登记根的定稿路径，Windows 用它派生卷级身份；
+/// 文件系统不支持身份字段时返回 `None`，由调用方 fail-closed。
 #[cfg(unix)]
-fn identity_of(meta: &std::fs::Metadata) -> RootIdentity {
+fn identity_of(meta: &std::fs::Metadata, _path: &Path) -> Option<RootIdentity> {
     use std::os::unix::fs::MetadataExt;
-    RootIdentity {
+    Some(RootIdentity {
         device: meta.dev(),
         index: meta.ino(),
-    }
+    })
 }
 
 #[cfg(windows)]
-fn identity_of(meta: &std::fs::Metadata) -> RootIdentity {
+fn identity_of(meta: &std::fs::Metadata, path: &Path) -> Option<RootIdentity> {
     use std::os::windows::fs::MetadataExt;
-    let index = (u64::from(meta.file_index_high()) << 32) | u64::from(meta.file_index_low());
-    RootIdentity {
-        device: u64::from(meta.volume_serial_number()),
+    // `file_index()` 是 stable 唯一的文件身份字段（`file_index_high/low` 与
+    // `volume_serial_number` 均属 unstable `windows_by_handle`）；不支持的
+    // 卷（部分网络文件系统）返回 None —— 身份不可核验，登记/存活判定拒绝。
+    let index = meta.file_index()?;
+    Some(RootIdentity {
+        device: volume_device(path),
         index,
-    }
+    })
+}
+
+/// 卷级身份：canonical 路径卷前缀（`\\?\C:\` / `\\?\Volume{guid}` /
+/// UNC）的哈希。同一根的所有身份复核都基于登记时的同一条定稿路径，前缀
+/// 恒定；仅进程内比较，不持久化，DefaultHasher 足够。
+#[cfg(windows)]
+fn volume_device(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", path.components().next()).hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 非 unix/windows 平台没有可复核的身份字段——但根身份的 fail-closed 语义要求
 /// 一个确定值，这里固定返回同一占位值并在 `root_live` 里退化为"路径还是目录"，
 /// 与旧实现等价。三个目标平台都落在 unix/windows 上，此分支是保守兜底。
 #[cfg(not(any(unix, windows)))]
-fn identity_of(_meta: &std::fs::Metadata) -> RootIdentity {
-    RootIdentity {
+fn identity_of(_meta: &std::fs::Metadata, _path: &Path) -> Option<RootIdentity> {
+    Some(RootIdentity {
         device: 0,
         index: 0,
-    }
+    })
 }
 
 /// 根当前还在不在且**还是登记时的那棵树**：路径统计出的身份仍等于登记身份。
@@ -347,7 +363,7 @@ fn identity_of(_meta: &std::fs::Metadata) -> RootIdentity {
 /// （身份失配）三种形态在这里都归 `false`。
 fn root_live(path: &Path, identity: RootIdentity) -> bool {
     match std::fs::metadata(path) {
-        Ok(meta) => meta.is_dir() && identity_of(&meta) == identity,
+        Ok(meta) => meta.is_dir() && identity_of(&meta, path) == Some(identity),
         Err(_) => false,
     }
 }
@@ -585,10 +601,10 @@ fn sweep_expired_trash(trash_dir: &Dir, cutoff_ms: i64) {
 }
 
 /// 从已打开的目录句柄取文件系统身份（`dir` → `File` → `metadata`）。
-fn identity_of_dir(dir: &Dir) -> Result<RootIdentity, ConfineError> {
+fn identity_of_dir(dir: &Dir, path: &Path) -> Result<RootIdentity, ConfineError> {
     let file = dir.try_clone().map_err(confine_io_error)?.into_std_file();
     let meta = file.metadata().map_err(confine_io_error)?;
-    Ok(identity_of(&meta))
+    identity_of(&meta, path).ok_or(ConfineError::Denied)
 }
 
 #[async_trait]
@@ -601,10 +617,10 @@ impl ShareConfinementPort for CapStdConfinement {
         let canonical = std::fs::canonicalize(path).map_err(root_io_error)?;
         let dir = Dir::open_ambient_dir(&canonical, ambient_authority()).map_err(root_io_error)?;
 
-        let handle_identity = identity_of_dir(&dir)?;
+        let handle_identity = identity_of_dir(&dir, &canonical)?;
         let path_identity = std::fs::metadata(&canonical)
-            .map(|meta| identity_of(&meta))
-            .map_err(root_io_error)?;
+            .map_err(root_io_error)
+            .and_then(|meta| identity_of(&meta, &canonical).ok_or(ConfineError::Denied))?;
         if handle_identity != path_identity {
             // 句柄与路径指向不同的树：登记即失败（不猜哪一边对）。
             return Err(ConfineError::Denied);
