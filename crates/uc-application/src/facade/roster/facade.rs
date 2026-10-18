@@ -177,6 +177,7 @@ impl MemberRosterFacade {
                 pairing_state: "Trusted".to_string(),
                 channel: path.channel,
                 connection_address: path.address,
+                connection_local_address: path.local_address,
             });
         }
         Ok(snapshots)

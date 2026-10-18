@@ -243,7 +243,7 @@ impl ProtocolHandler for IrohClipboardReceiverHandler {
 
             // 认证后的任务通过原有广播交接；没有消费者时拒绝，绝不伪报保存成功。
             let (receipt, result) = InboundClipboardReceipt::pending();
-            let transport = path_for(&self.state.endpoint, remote, OnMissing::Unknown)
+            let transport = path_for(&self.state.endpoint, remote, OnMissing::Unknown, None)
                 .await
                 .channel;
             let inbound = InboundClipboard {

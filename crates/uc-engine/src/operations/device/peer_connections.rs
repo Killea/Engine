@@ -28,6 +28,7 @@ pub(crate) async fn execute_query_peer_connections(
                 pairing_state: peer.pairing_state,
                 channel: map_channel(peer.channel),
                 connection_address: peer.connection_address,
+                connection_local_address: peer.connection_local_address,
             })
             .collect(),
     ))
@@ -128,6 +129,7 @@ mod tests {
             pairing_state: "Trusted".to_owned(),
             channel: ConnectionChannel::Relay,
             connection_address: relay_url.map(str::to_owned),
+            connection_local_address: None,
         }
     }
 

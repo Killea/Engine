@@ -69,10 +69,15 @@ impl Default for ConnectionChannel {
 /// - `Direct`：对端 IP:port
 /// - `Relay`：中转 URL
 /// - `Offline` / `Unknown`：通常为 `None`
+///
+/// `local_address` 记录该活跃路径的**本端**侧地址（直连时是本机出口
+/// 网卡 IP，中继时是中转 URL），来源是 iroh `PathEvent` 观测而非
+/// `remote_info`（后者只含对端侧地址）；观测缺失时为 `None`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionPath {
     pub channel: ConnectionChannel,
     pub address: Option<String>,
+    pub local_address: Option<String>,
 }
 
 impl Default for ConnectionPath {
@@ -80,6 +85,7 @@ impl Default for ConnectionPath {
         Self {
             channel: ConnectionChannel::Unknown,
             address: None,
+            local_address: None,
         }
     }
 }

@@ -67,6 +67,9 @@ pub struct PeerSnapshotView {
     pub pairing_state: String,
     pub channel: ConnectionChannel,
     pub connection_address: Option<String>,
+    /// 活跃路径的本端侧地址（直连=本机出口 IP，中继=relay URL）；
+    /// 来自 PathEvent 观测，缺失时为 None。
+    pub connection_local_address: Option<String>,
 }
 
 /// 应用层成员摘要。对外只暴露稳定字符串和值对象,不暴露 core 类型。

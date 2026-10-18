@@ -1139,6 +1139,9 @@ pub struct PeerConnectionSummary {
     pub pairing_state: String,
     pub channel: PeerConnectionChannelSummary,
     pub connection_address: Option<String>,
+    /// Local side of the active path (direct: egress interface IP; relay:
+    /// relay URL), sourced from PathEvent observation; None when unobserved.
+    pub connection_local_address: Option<String>,
 }
 
 impl fmt::Debug for PeerConnectionSummary {
@@ -1152,6 +1155,10 @@ impl fmt::Debug for PeerConnectionSummary {
             .field("has_pairing_state", &!self.pairing_state.is_empty())
             .field("channel", &self.channel)
             .field("has_connection_address", &self.connection_address.is_some())
+            .field(
+                "has_connection_local_address",
+                &self.connection_local_address.is_some(),
+            )
             .finish()
     }
 }

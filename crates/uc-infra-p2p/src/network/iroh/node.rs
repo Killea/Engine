@@ -223,7 +223,10 @@ pub struct IrohNode {
 impl IrohNode {
     /// 为下一代空间会话准备协议能力，但不影响当前会话。
     pub fn prepare_session(&self) -> IrohSessionBuilder {
-        IrohSessionBuilder::new(Arc::clone(&self.session_context))
+        IrohSessionBuilder::new(
+            Arc::clone(&self.session_context),
+            self.connection_observations.path_local_addrs(),
+        )
     }
 
     /// 停止当前空间会话并排空其连接，长期网络节点继续运行。
@@ -662,6 +665,7 @@ struct IrohSessionContext {
 pub struct IrohSessionBuilder {
     context: Arc<IrohSessionContext>,
     handlers: SessionProtocolHandlersBuilder,
+    path_local_addrs: super::observed_connections::PathLocalAddrs,
 }
 
 pub struct PreparedIrohSession {
@@ -675,10 +679,14 @@ impl PreparedIrohSession {
 }
 
 impl IrohSessionBuilder {
-    fn new(context: Arc<IrohSessionContext>) -> Self {
+    fn new(
+        context: Arc<IrohSessionContext>,
+        path_local_addrs: super::observed_connections::PathLocalAddrs,
+    ) -> Self {
         Self {
             context,
             handlers: SessionProtocolHandlersBuilder::new(),
+            path_local_addrs,
         }
     }
 
@@ -817,7 +825,10 @@ impl IrohSessionBuilder {
 impl IrohNodeBuilder {
     /// 创建一套尚未发布的空间会话能力。
     pub fn prepare_session(&self) -> IrohSessionBuilder {
-        IrohSessionBuilder::new(Arc::clone(&self.session_context))
+        IrohSessionBuilder::new(
+            Arc::clone(&self.session_context),
+            self.connection_observations.path_local_addrs(),
+        )
     }
 
     /// Bind the iroh endpoint, reusing the Ed25519 secret persisted by
@@ -1153,6 +1164,7 @@ impl IrohSessionBuilder {
         Arc::new(IrohConnectionChannelAdapter::new(
             Arc::clone(&self.context.endpoint),
             peer_addr_repo,
+            self.path_local_addrs.clone(),
         ))
     }
 

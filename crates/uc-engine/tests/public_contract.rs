@@ -430,6 +430,7 @@ fn peer_connection_contract_preserves_status_without_debugging_identity_or_addre
         pairing_state: "paired".into(),
         channel: uc_engine::PeerConnectionChannelSummary::Direct,
         connection_address: Some("private-active-address".into()),
+        connection_local_address: Some("private-local-address".into()),
     }]);
     let refreshed =
         OperationResult::PeerConnectionsRefreshed(uc_engine::PeerConnectionRefreshSummary {
@@ -443,6 +444,7 @@ fn peer_connection_contract_preserves_status_without_debugging_identity_or_addre
     for secret in [
         "private-peer-id",
         "Private Mac",
+        "private-local-address",
         "private-address",
         "private-active-address",
     ] {

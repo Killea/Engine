@@ -48,6 +48,7 @@ use uc_core::ports::connection_channel::{ConnectionChannelPort, ConnectionPath};
 use uc_core::ports::peer_address::PeerAddressRepositoryPort;
 
 use super::conn_path::{path_for, OnMissing};
+use super::observed_connections::PathLocalAddrs;
 use super::peer_address_resolver::PeerAddressResolver;
 use uc_observability_contract::uc_debug;
 
@@ -55,16 +56,19 @@ use uc_observability_contract::uc_debug;
 pub struct IrohConnectionChannelAdapter {
     endpoint: Arc<Endpoint>,
     peer_address_resolver: PeerAddressResolver,
+    path_local_addrs: PathLocalAddrs,
 }
 
 impl IrohConnectionChannelAdapter {
-    pub fn new(
+    pub(crate) fn new(
         endpoint: Arc<Endpoint>,
         peer_addr_repo: Arc<dyn PeerAddressRepositoryPort>,
+        path_local_addrs: PathLocalAddrs,
     ) -> Self {
         Self {
             endpoint,
             peer_address_resolver: PeerAddressResolver::new(peer_addr_repo),
+            path_local_addrs,
         }
     }
 }
@@ -90,6 +94,12 @@ impl ConnectionChannelPort for IrohConnectionChannelAdapter {
 
         // Step 2: snapshot magicsock state and classify. No `RemoteInfo` at
         // all ⇒ peer never observed by magicsock ⇒ Offline (see `OnMissing`).
-        path_for(&self.endpoint, endpoint_addr.id, OnMissing::Offline).await
+        path_for(
+            &self.endpoint,
+            endpoint_addr.id,
+            OnMissing::Offline,
+            Some(&self.path_local_addrs),
+        )
+        .await
     }
 }

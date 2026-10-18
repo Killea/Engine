@@ -370,7 +370,7 @@ impl ClipboardDispatchPort for IrohClipboardDispatchAdapter {
         //    settles reflects the route the frame took (direct vs relay);
         //    `None` means the snapshot momentarily lags the just-settled
         //    dial, reported as Unknown.
-        let transport = path_for(&self.endpoint, addr_id, OnMissing::Unknown)
+        let transport = path_for(&self.endpoint, addr_id, OnMissing::Unknown, None)
             .await
             .channel;
 

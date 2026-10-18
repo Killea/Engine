@@ -20,6 +20,8 @@ use iroh::{Endpoint, EndpointId, TransportAddr};
 
 use uc_core::ports::connection_channel::{ConnectionChannel, ConnectionPath};
 
+use super::observed_connections::PathLocalAddrs;
+
 /// What [`path_for`] reports when `remote_info(id)` returns `None` — the
 /// endpoint has no [`iroh::endpoint::RemoteInfo`] for the peer at all. This is
 /// the *only* point the two callers legitimately diverge, so it is an explicit
@@ -56,12 +58,24 @@ pub(crate) async fn path_for(
     endpoint: &Endpoint,
     id: EndpointId,
     on_missing: OnMissing,
+    local_addrs: Option<&PathLocalAddrs>,
 ) -> ConnectionPath {
     match endpoint.remote_info(id).await {
-        Some(info) => derive_path_from_addrs(info.addrs()),
+        Some(info) => {
+            let (channel, remote) = derive_path_from_addrs(info.addrs());
+            let local_address = remote
+                .as_ref()
+                .and_then(|addr| local_addrs.and_then(|l| l.local_addr(id.as_bytes(), addr)));
+            ConnectionPath {
+                channel,
+                address: remote.map(|addr| addr.to_string()),
+                local_address,
+            }
+        }
         None => ConnectionPath {
             channel: on_missing.channel(),
             address: None,
+            local_address: None,
         },
     }
 }
@@ -74,13 +88,13 @@ pub(crate) async fn path_for(
 /// (relay is only a fallback candidate). Having a `RemoteInfo` but no
 /// `Active` path ⇒ `Unknown` (mid-handshake / probing); nothing known ⇒
 /// `Offline`.
-fn derive_path_from_addrs<'a, I>(addrs: I) -> ConnectionPath
+fn derive_path_from_addrs<'a, I>(addrs: I) -> (ConnectionChannel, Option<TransportAddr>)
 where
     I: IntoIterator<Item = &'a iroh::endpoint::TransportAddrInfo>,
 {
     let mut saw_any = false;
-    let mut active_direct: Option<String> = None;
-    let mut active_relay: Option<String> = None;
+    let mut active_direct: Option<TransportAddr> = None;
+    let mut active_relay: Option<TransportAddr> = None;
 
     for a in addrs {
         saw_any = true;
@@ -88,12 +102,12 @@ where
             (iroh::endpoint::TransportAddrUsage::Active, TransportAddr::Ip(s))
                 if !is_filtered_ip(s.ip()) && active_direct.is_none() =>
             {
-                active_direct = Some(s.to_string());
+                active_direct = Some(a.addr().clone());
             }
-            (iroh::endpoint::TransportAddrUsage::Active, TransportAddr::Relay(u))
+            (iroh::endpoint::TransportAddrUsage::Active, TransportAddr::Relay(_))
                 if active_relay.is_none() =>
             {
-                active_relay = Some(u.to_string());
+                active_relay = Some(a.addr().clone());
             }
             // Inactive / discovery candidates: do not promote, but keep
             // `saw_any = true` so the empty-set tail returns Offline only
@@ -102,29 +116,18 @@ where
         }
     }
 
-    if let Some(address) = active_direct {
-        // 多条同时活跃时优先汇报 Direct —— IP 直连一旦建立就是当前流量
-        // 路径,relay 退化为可选 fallback。
-        ConnectionPath {
-            channel: ConnectionChannel::Direct,
-            address: Some(address),
-        }
-    } else if let Some(address) = active_relay {
-        ConnectionPath {
-            channel: ConnectionChannel::Relay,
-            address: Some(address),
-        }
+    // 多条同时活跃时优先汇报 Direct —— IP 直连一旦建立就是当前流量
+    // 路径,relay 退化为可选 fallback。返回的 TransportAddr 同时供
+    // path_for 回查 PathLocalAddrs 补本端地址。
+    if let Some(addr) = active_direct {
+        (ConnectionChannel::Direct, Some(addr))
+    } else if let Some(addr) = active_relay {
+        (ConnectionChannel::Relay, Some(addr))
     } else if saw_any {
         // 有 RemoteInfo 但没有 Active 路径 ⇒ 还在握手 / probe
-        ConnectionPath {
-            channel: ConnectionChannel::Unknown,
-            address: None,
-        }
+        (ConnectionChannel::Unknown, None)
     } else {
-        ConnectionPath {
-            channel: ConnectionChannel::Offline,
-            address: None,
-        }
+        (ConnectionChannel::Offline, None)
     }
 }
 
