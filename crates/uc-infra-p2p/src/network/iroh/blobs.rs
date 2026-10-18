@@ -14,11 +14,13 @@ use iroh::Endpoint;
 use iroh_blobs::{
     api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode},
     api::downloader::{DownloadProgressItem, Downloader},
+    api::proto::ExportRangesItem,
     store::fs::FsStore,
     ticket::BlobTicket as NativeBlobTicket,
     BlobFormat, Hash, HashAndFormat,
 };
 use iroh_tickets::Ticket;
+use range_collections::RangeSet2;
 use tokio_util::io::ReaderStream;
 use tracing::instrument;
 
@@ -29,7 +31,9 @@ use uc_observability_contract::diagnostics::connectivity::{
     LocalWorkObservation, LocalWorkOutcome, LocalWorkStep,
 };
 use uc_observability_contract::{
-    error_source::io_error_kind, log_fields::log_vocab_debug, uc_debug, uc_info, uc_warn,
+    error_source::{find_source, io_error_kind},
+    log_fields::log_vocab_debug,
+    uc_debug, uc_info, uc_warn,
 };
 
 /// Minimum wall-clock interval between two `BlobProgressSink::report` calls.
@@ -106,6 +110,49 @@ impl IrohBlobTransferAdapter {
     fn downloader(&self) -> &Downloader {
         self.downloader
             .get_or_init(|| self.store.downloader(&self.endpoint))
+    }
+
+    /// `export_ranges` 流式兜底:不经 EntryState 门控,直接把 blob 字节按
+    /// 偏移写进 target。叶子按序到达,顺序写即可。
+    async fn export_ranges_to_path(
+        &self,
+        hash: Hash,
+        target_path: &std::path::Path,
+    ) -> Result<u64, BlobError> {
+        use tokio::io::AsyncWriteExt;
+
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| BlobError::Internal(e.into()))?;
+        }
+        let mut file = tokio::fs::File::create(target_path)
+            .await
+            .map_err(|e| BlobError::Internal(e.into()))?;
+        let mut stream = self
+            .store
+            .blobs()
+            .export_ranges(hash, RangeSet2::all())
+            .stream();
+        let mut written: u64 = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ExportRangesItem::Size(_) => {}
+                ExportRangesItem::Data(leaf) => {
+                    file.write_all(&leaf.data)
+                        .await
+                        .map_err(|e| BlobError::Internal(e.into()))?;
+                    written += leaf.data.len() as u64;
+                }
+                ExportRangesItem::Error(e) => {
+                    return Err(BlobError::Internal(e.into()));
+                }
+            }
+        }
+        file.flush()
+            .await
+            .map_err(|e| BlobError::Internal(e.into()))?;
+        Ok(written)
     }
 
     fn native_hash(digest: &BlobDigest) -> Hash {
@@ -372,7 +419,7 @@ impl BlobTransferPort for IrohBlobTransferAdapter {
         self.ensure_blob_in_store(&native, progress).await?;
 
         let export_start = Instant::now();
-        let bytes_written = self
+        let export_result = self
             .store
             .blobs()
             .export_with_opts(ExportOptions {
@@ -380,12 +427,32 @@ impl BlobTransferPort for IrohBlobTransferAdapter {
                 mode: ExportMode::TryReference,
                 target: target_path.to_owned(),
             })
-            .await
-            .map_err(|e| BlobError::Internal(e.into()))?;
+            .await;
+        // Entry-state divergence workaround (iroh-blobs fs-store 0.103):
+        // `export_path_impl` 依据 meta DB 的 EntryState 判完整性,而下载路径
+        // 曾观察到 bitfield 与数据已完整落盘、EntryState 却永久滞留
+        // `Partial`("cannot export partial entry")。该路径只影响 fast
+        // path;`export_ranges` 不查 EntryState,直接按 bitfield 流数据,
+        // 作为同一数据的等价落地通道兜底。
+        let bytes_written = match export_result {
+            Ok(bytes) => bytes,
+            Err(e)
+                if find_source::<std::io::Error>(&e)
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidInput) =>
+            {
+                uc_warn!(
+                    io_error_kind = io_error_kind(&e),
+                    "blob fetch_to_path: export refused by entry state; falling back to export_ranges"
+                );
+                self.export_ranges_to_path(native.hash(), target_path)
+                    .await?
+            }
+            Err(e) => return Err(BlobError::Internal(e.into())),
+        };
         uc_info!(
             bytes = bytes_written,
             export_ms = export_start.elapsed().as_millis() as u64,
-            "blob fetch_to_path: export completed (TryReference)"
+            "blob fetch_to_path: export completed"
         );
         Ok(digest)
     }

@@ -7362,6 +7362,7 @@ dependencies = [
  "opentelemetry_sdk",
  "postcard",
  "rand 0.9.4",
+ "range-collections",
  "reqwest 0.12.28",
  "rustls",
  "serde",
