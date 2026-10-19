@@ -34,7 +34,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -42,6 +42,7 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use uc_core::ports::remote_share::{
@@ -70,6 +71,11 @@ const TRASH_META_NAME: &str = "meta.json";
 const TRASH_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// 自动改名探测的上界，超过即放弃而不是无限试探。
 const MAX_AUTO_RENAME_ATTEMPTS: u32 = 10_000;
+/// commit/abort 后暂存目录清理的重试参数：Windows 上一次瞬态句柄竞争
+/// （杀毒扫描、索引器）就足以让 `remove_dir_all` 失败，而兜底惰性清扫要
+/// 等到下一次根登记——那可能是整个会话之后。
+const STAGING_SWEEP_ATTEMPTS: u32 = 3;
+const STAGING_SWEEP_BACKOFF: Duration = Duration::from_millis(60);
 
 /// `meta.json` 的落盘形状：回收条目的原相对路径、删除时刻与形状摘要。
 /// 它写在根内保留命名空间，属于内核自有元数据；相对路径不含宿主绝对路径。
@@ -130,6 +136,10 @@ impl CapTargetToken {
 pub struct CapStdConfinement {
     roots: Arc<RwLock<HashMap<ShareRootId, RootHandle>>>,
     next_generation: Arc<AtomicU64>,
+    /// commit/abort 收尾清理失败的暂存 id 待重试表，按根归类：下一个同根
+    /// staging 动词惰性补扫，根登记/撤销时清账。`Mutex` 只保护表本身，
+    /// 持锁区间不做任何文件 I/O。
+    pending_sweeps: Arc<Mutex<HashMap<ShareRootId, Vec<String>>>>,
 }
 
 /// 段名字的本层规则。刻意不依赖"调用方已经筛查过整条路径"，也不依赖库在三个平台上
@@ -694,6 +704,10 @@ impl ShareConfinementPort for CapStdConfinement {
             sweep_expired_trash(&trash_dir, now_ms() - TRASH_RETENTION_MS);
         }
 
+        // 全量扫已把所有 staging 残留清掉，待重试表里的记录随之作废。
+        if let Ok(mut pending) = self.pending_sweeps.lock() {
+            pending.remove(&root);
+        }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         // 丢弃来源是 error-handling.md 列出的允许例外：锁中毒的 `PoisonError`
         // 持有 guard、不能跨线程保存，也不含可用诊断信息。此处按 fail-closed
@@ -717,6 +731,9 @@ impl ShareConfinementPort for CapStdConfinement {
     async fn unregister_root(&self, root: ShareRootId) {
         if let Ok(mut guard) = self.roots.write() {
             guard.remove(&root);
+        }
+        if let Ok(mut pending) = self.pending_sweeps.lock() {
+            pending.remove(&root);
         }
     }
 
@@ -1124,6 +1141,7 @@ impl ShareConfinementPort for CapStdConfinement {
 
     async fn create_staging(&self, root: ShareRootId) -> Result<String, ConfineError> {
         let (root_dir, _path, _identity, _generation) = self.opened_root(root)?;
+        self.sweep_pending_staging(root, &root_dir);
         let staging_id = Uuid::new_v4().to_string();
         root_dir
             .create_dir(staging_dir_name(&staging_id))
@@ -1182,6 +1200,7 @@ impl ShareConfinementPort for CapStdConfinement {
             return Err(ConfineError::Denied);
         }
         let (root_dir, _path, _identity, _generation) = self.opened_root(root)?;
+        self.sweep_pending_staging(root, &root_dir);
         let (dir_token, _dir_path) = self.live_token(dir)?;
         let dest_dir = open_target_dir(&dir_token)?;
         let Some(staging_dir) = open_staging_dir(&root_dir, staging_id)? else {
@@ -1190,18 +1209,32 @@ impl ShareConfinementPort for CapStdConfinement {
 
         let result = self.commit_entries(&staging_dir, &dest_dir, entries, policy);
         // 规格 §8.1：落位成功或失败都丢弃暂存目录（失败不留半成品）。清理失败
-        // 不翻转已完成的结果：残留只剩空目录，登记扫描的惰性清扫会收走它。
+        // 不翻转已完成的结果：重试仍失败时记入待重试表，下一个同根 staging
+        // 动词惰性补扫，登记扫描仍是最后兜底。
         // discarded-source[best-effort-cleanup]: `ConfineError`: a leftover staging
-        // dir after a finished commit/abort contains only empty dirs and is swept
-        // on the next registration scan.
-        let _ = remove_staging_tree(&root_dir, staging_id);
+        // dir after a finished commit contains only empty dirs and is retried on
+        // the next staging verb for the same root.
+        if self
+            .remove_staging_retried(&root_dir, staging_id)
+            .await
+            .is_err()
+        {
+            self.defer_staging_sweep(root, staging_id);
+        }
         result
     }
 
     async fn abort_staging(&self, root: ShareRootId, staging_id: &str) -> Result<(), ConfineError> {
         check_opaque_id(staging_id)?;
         let (root_dir, _path, _identity, _generation) = self.opened_root(root)?;
-        remove_staging_tree(&root_dir, staging_id)
+        self.sweep_pending_staging(root, &root_dir);
+        match self.remove_staging_retried(&root_dir, staging_id).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.defer_staging_sweep(root, staging_id);
+                Err(err)
+            }
+        }
     }
 }
 
@@ -1316,6 +1349,61 @@ impl CapStdConfinement {
                 .map_err(confine_io_error)?;
         }
         Ok(())
+    }
+
+    /// 把一次失败的暂存清理记入待重试表，等下一个同根 staging 动词惰性补扫；
+    /// 登记扫描仍是最后兜底（`register_root` 的保留命名空间全量扫）。
+    fn defer_staging_sweep(&self, root: ShareRootId, staging_id: &str) {
+        if let Ok(mut pending) = self.pending_sweeps.lock() {
+            pending.entry(root).or_default().push(staging_id.to_owned());
+        }
+    }
+
+    /// 惰性补扫：重试本根此前失败的暂存清理，仍失败的留回表里等下一轮。
+    /// 只在 staging 动词上调用——`resolve`/list 这类读路径不背这个成本。
+    fn sweep_pending_staging(&self, root: ShareRootId, root_dir: &Dir) {
+        let ids = {
+            let Ok(mut pending) = self.pending_sweeps.lock() else {
+                return;
+            };
+            match pending.get_mut(&root) {
+                Some(ids) if !ids.is_empty() => std::mem::take(ids),
+                _ => return,
+            }
+        };
+        let mut failed = Vec::new();
+        for staging_id in ids {
+            if remove_staging_tree(root_dir, &staging_id).is_err() {
+                failed.push(staging_id);
+            }
+        }
+        if !failed.is_empty() {
+            if let Ok(mut pending) = self.pending_sweeps.lock() {
+                pending.entry(root).or_default().extend(failed);
+            }
+        }
+    }
+
+    /// 有界重试的暂存清理：瞬态句柄竞争通常在几十毫秒内释放，重试三次后
+    /// 仍失败才交回调用方决定（记表或透传）。
+    async fn remove_staging_retried(
+        &self,
+        root_dir: &Dir,
+        staging_id: &str,
+    ) -> Result<(), ConfineError> {
+        let mut attempt = 0;
+        loop {
+            match remove_staging_tree(root_dir, staging_id) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    attempt += 1;
+                    if attempt >= STAGING_SWEEP_ATTEMPTS {
+                        return Err(err);
+                    }
+                    sleep(STAGING_SWEEP_BACKOFF).await;
+                }
+            }
+        }
     }
 }
 

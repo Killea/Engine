@@ -993,6 +993,77 @@ async fn staging_commit_and_abort() {
     assert!(!abort_path.exists());
 }
 
+/// commit 收尾的暂存目录清理失败不得翻转落位结果：残留先记表，下一个同根
+/// staging 动词惰性补扫——Windows 瞬态句柄场景的固化回归（失败机制用只读
+/// 子目录模拟，观察面相同）。
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_cleanup_failure_is_reswept_on_next_staging_verb() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new().await;
+    let dest_dir = harness
+        .confinement
+        .resolve(harness.root_id, "public")
+        .await
+        .expect("dest dir");
+
+    let staging = harness
+        .confinement
+        .create_staging(harness.root_id)
+        .await
+        .expect("create staging");
+    let staged_file = harness
+        .confinement
+        .staging_entry_path(harness.root_id, &staging, "landed.bin", false)
+        .await
+        .expect("staged file");
+    fs::write(&staged_file, b"payload").expect("write staged");
+
+    // 清单外留一个只读子目录，`remove_dir_all` 对它 unlink 失败。
+    let staging_root = harness
+        .tmp()
+        .join(format!("root/.uniclipboard-staging-{staging}"));
+    let locked_sub = staging_root.join("leftover");
+    fs::create_dir(&locked_sub).expect("locked sub");
+    fs::write(locked_sub.join("keep.txt"), b"x").expect("locked file");
+    fs::set_permissions(&locked_sub, fs::Permissions::from_mode(0o555)).expect("chmod ro");
+
+    let entries = [ShareStagedEntry {
+        rel: "landed.bin".to_owned(),
+        is_dir: false,
+        size_bytes: 7,
+    }];
+    harness
+        .confinement
+        .commit_staging(
+            harness.root_id,
+            &staging,
+            &dest_dir,
+            &entries,
+            ConflictPolicy::AutoRename,
+        )
+        .await
+        .expect("commit result must not flip on cleanup failure");
+    assert_eq!(
+        fs::read(harness.tmp().join("root/public/landed.bin")).expect("landed"),
+        b"payload"
+    );
+    assert!(staging_root.exists(), "cleanup failure must leave residue");
+
+    // 故障解除后，下一个同根 staging 动词惰性补扫——不必等下一次根登记。
+    fs::set_permissions(&locked_sub, fs::Permissions::from_mode(0o755)).expect("chmod rw");
+    harness
+        .confinement
+        .create_staging(harness.root_id)
+        .await
+        .expect("next staging verb");
+    assert!(
+        !staging_root.exists(),
+        "pending sweep must reclaim the residue"
+    );
+}
+
 /// 同根改名与复制走保留句柄、不允许跨根。
 #[tokio::test]
 async fn rename_and_copy_within_root() {
