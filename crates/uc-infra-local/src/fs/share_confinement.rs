@@ -1208,6 +1208,10 @@ impl ShareConfinementPort for CapStdConfinement {
         };
 
         let result = self.commit_entries(&staging_dir, &dest_dir, entries, policy);
+        // 落位用完才放句：cap-std 在 Windows 上以无 FILE_SHARE_DELETE 打开目录
+        // （dir_utils.rs 的设计决策），持着 `staging_dir` 调 RemoveDirectory
+        // 必然 ACCESS_DENIED，会留下空残留目录。
+        drop(staging_dir);
         // 规格 §8.1：落位成功或失败都丢弃暂存目录（失败不留半成品）。清理失败
         // 不翻转已完成的结果：重试仍失败时记入待重试表，下一个同根 staging
         // 动词惰性补扫，登记扫描仍是最后兜底。
