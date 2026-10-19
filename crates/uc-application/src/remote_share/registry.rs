@@ -17,7 +17,9 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use uc_core::ports::remote_share::{
     ConfineError, ShareConfinementPort, ShareRootId, ShareStoreDoc, SharedRootStoreError,
     SharedRootStorePort,
@@ -34,6 +36,9 @@ pub struct ShareRootsRegistry {
     /// 清单写路径的串行闸：load→save→收敛必须对其它写者整体互斥，否则
     /// 并发 PUT/suspend 会交错丢更新（读-改-写竞态）。
     doc_write: tokio::sync::Mutex<()>,
+    /// 最近一次自愈收敛的尝试时刻：`reconcile_if_stale` 的去抖凭据，持锁
+    /// 区间只含读写这一个值，从不跨 `.await`。
+    last_lazy_reconcile: Mutex<Option<Instant>>,
 }
 
 /// 一次收敛的稳定结果（供装配层记录/判定，不携带任何路径或根标识明细）。
@@ -57,6 +62,7 @@ impl ShareRootsRegistry {
             confinement,
             registered: Mutex::new(HashSet::new()),
             doc_write: tokio::sync::Mutex::new(()),
+            last_lazy_reconcile: Mutex::new(None),
         }
     }
 
@@ -221,6 +227,39 @@ impl ShareRootsRegistry {
     }
 }
 
+/// 自愈收敛的最短间隔：登记表缺席但清单授权通过的每个动词都可能探到
+/// `reconcile_if_stale`，持久登记失败的根不能让每次动词都重跑全量收敛。
+const LAZY_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 登记表自愈入口：serve 侧在「清单授权通过、登记表缺席」时请求一次重
+/// 收敛。唯一实现者是 `ShareRootsRegistry`——登记动作的唯一责任人；调用
+/// 方只能触发收敛，不得自行登记。
+#[async_trait]
+pub trait ShareRootsReconciler: Send + Sync {
+    /// 去抖的全量重收敛：距上次自愈尝试不足 `LAZY_RECONCILE_INTERVAL` 时
+    /// 直接返回。收敛语义与 `reconcile_startup` 完全一致——清单仍不可读则
+    /// 全量撤销（fail-closed），单根失败只影响该根。
+    async fn reconcile_if_stale(&self);
+}
+
+#[async_trait]
+impl ShareRootsReconciler for ShareRootsRegistry {
+    async fn reconcile_if_stale(&self) {
+        {
+            // 检查与落笔在同一持锁区间，保证同一间隔内只有一个自愈尝试。
+            let mut last = match self.last_lazy_reconcile.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if last.is_some_and(|at| at.elapsed() < LAZY_RECONCILE_INTERVAL) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        self.reconcile_startup().await;
+    }
+}
+
 /// 日志只记失败种类字面量：`ConfineError::Io` 的 source 是下层 io 错误，
 /// 正文可能携带路径，绝不带进字段值（与 authorizer 的同一规则）。
 fn confine_reason(error: &ConfineError) -> &'static str {
@@ -254,6 +293,7 @@ mod tests {
     struct StubStore {
         doc: Mutex<ShareStoreDoc>,
         fail_load: AtomicBool,
+        loads: AtomicUsize,
         saves: AtomicUsize,
     }
 
@@ -262,6 +302,7 @@ mod tests {
             Arc::new(Self {
                 doc: Mutex::new(doc),
                 fail_load: AtomicBool::new(false),
+                loads: AtomicUsize::new(0),
                 saves: AtomicUsize::new(0),
             })
         }
@@ -270,6 +311,7 @@ mod tests {
     #[async_trait]
     impl SharedRootStorePort for StubStore {
         async fn load(&self) -> Result<ShareStoreDoc, SharedRootStoreError> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
             if self.fail_load.load(Ordering::Relaxed) {
                 return Err(SharedRootStoreError::NotUnlocked);
             }
@@ -570,5 +612,40 @@ mod tests {
         assert!(outcome.is_err());
         // save 没成功，登记表保持旧状态：根 1 仍然登记着。
         assert_eq!(confinement.set().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_if_stale_converges_after_store_recovers() {
+        // 复现启动先于解锁的场景：启动收敛时清单不可读，登记表被清空；
+        // 清单恢复可读后，自愈请求必须重新登记启用根。
+        let store = StubStore::with(doc(vec![root(1, true)], false));
+        store.fail_load.store(true, Ordering::Relaxed);
+        let confinement = StubConfinement::with(HashSet::new());
+        let registry = ShareRootsRegistry::new(port_store(&store), port_confinement(&confinement));
+        registry.reconcile_startup().await;
+        assert!(confinement.registered_set().is_empty());
+
+        store.fail_load.store(false, Ordering::Relaxed);
+        ShareRootsReconciler::reconcile_if_stale(&registry).await;
+        assert_eq!(confinement.registered_set().len(), 1);
+        assert!(confinement.registered_set().contains(&root_id(1)));
+    }
+
+    #[tokio::test]
+    async fn reconcile_if_stale_is_debounced() {
+        // 去抖：同一间隔内的第二次自愈请求不得再读清单。持久登记失败的
+        // 根（fail_on 常驻）尤其不能让每次动词都跑一遍全量收敛。
+        let store = StubStore::with(doc(vec![root(1, true), root(2, true)], false));
+        let failing: HashSet<_> = [root_id(2)].into_iter().collect();
+        let confinement = StubConfinement::with(failing);
+        let registry = ShareRootsRegistry::new(port_store(&store), port_confinement(&confinement));
+
+        ShareRootsReconciler::reconcile_if_stale(&registry).await;
+        let loads = store.loads.load(Ordering::Relaxed);
+        assert!(confinement.registered_set().contains(&root_id(1)));
+        assert!(!confinement.registered_set().contains(&root_id(2)));
+
+        ShareRootsReconciler::reconcile_if_stale(&registry).await;
+        assert_eq!(store.loads.load(Ordering::Relaxed), loads);
     }
 }

@@ -18,5 +18,5 @@ pub use client::{
     ShareTransferCancelOutcome, ShareUploadItem, ShareUploadReport, ShareUploadSource,
 };
 pub use facade::{RemoteShareFacade, RemoteShareFacadeDeps};
-pub use registry::{ReconcileReport, ShareRootsRegistry};
+pub use registry::{ReconcileReport, ShareRootsReconciler, ShareRootsRegistry};
 pub use serve_handler::{RemoteShareServe, RemoteShareServeDeps};

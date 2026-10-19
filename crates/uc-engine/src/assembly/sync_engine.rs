@@ -30,7 +30,7 @@ use uc_application::deps::{
 use uc_application::facade::{
     remote_share::{
         RemoteShareClient, RemoteShareClientDeps, RemoteShareServe, RemoteShareServeDeps,
-        ShareRootsRegistry,
+        ShareRootsReconciler, ShareRootsRegistry,
     },
     ApplicationAssembly,
 };
@@ -548,6 +548,19 @@ pub async fn prepare_sync_session(
         content_gate,
     )?;
 
+    // Converge the persisted share document onto the fresh confinement
+    // registry: the registry is in-memory, so every enabled root must be
+    // re-registered at session start or inbound ops fail closed as `RootGone`.
+    // The registry handle stays on the session assembly — it is also the sole
+    // write-path owner for future share/unshare/suspend actions, and the serve
+    // handler reaches it through `ShareRootsReconciler` to self-heal a root the
+    // startup reconcile missed (e.g. daemon booted before the store unlocked).
+    let share_roots = Arc::new(ShareRootsRegistry::new(
+        Arc::clone(&space_setup.space_access.share_store),
+        Arc::clone(&space_setup.remote_share.confinement),
+    ));
+    let remote_share_reconciler: Arc<dyn ShareRootsReconciler> = share_roots.clone();
+
     // Install the remote-share/1 control-plane ALPN (device file sharing:
     // metadata ops + staging/commit/abort + export). The serve port enforces
     // the authorize→confine→read AND (fail-closed) per request; bulk bytes
@@ -566,20 +579,12 @@ pub async fn prepare_sync_session(
         Arc::new(RemoteShareServe::new(RemoteShareServeDeps {
             share_store: Arc::clone(&space_setup.space_access.share_store),
             confinement: Arc::clone(&space_setup.remote_share.confinement),
+            reconciler: remote_share_reconciler,
             blobs: Arc::clone(&blob_transfer),
             progress: Arc::clone(&outbound_progress_reporter),
         })) as Arc<dyn RemoteShareServePort>,
     )?;
 
-    // Converge the persisted share document onto the fresh confinement
-    // registry: the registry is in-memory, so every enabled root must be
-    // re-registered at session start or inbound ops fail closed as `RootGone`.
-    // The registry handle stays on the session assembly — it is also the sole
-    // write-path owner for future share/unshare/suspend actions.
-    let share_roots = Arc::new(ShareRootsRegistry::new(
-        Arc::clone(&space_setup.space_access.share_store),
-        Arc::clone(&space_setup.remote_share.confinement),
-    ));
     share_roots.reconcile_startup().await;
 
     // 出站侧负责人：browse/mutation 直通 + upload/download 编排（本机

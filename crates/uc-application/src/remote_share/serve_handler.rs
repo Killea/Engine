@@ -44,6 +44,7 @@ use uc_core::ports::remote_share::{
 };
 
 use crate::remote_share::authorizer::ShareAuthorizer;
+use crate::remote_share::registry::ShareRootsReconciler;
 use crate::remote_share::transfer::ShareTransferCoordinator;
 
 /// Ports the serve handler consumes.
@@ -52,6 +53,11 @@ pub struct RemoteShareServeDeps {
     pub share_store: Arc<dyn SharedRootStorePort>,
     /// The cap-std confinement registry (root lifecycle + path resolution + verbs).
     pub confinement: Arc<dyn ShareConfinementPort>,
+    /// The registration owner, asked to re-converge when the doc authorizes a
+    /// root the registration set missed (boot-before-unlock startup reconcile,
+    /// or a transient single-root register failure). Debounced inside; the
+    /// caller never registers roots itself.
+    pub reconciler: Arc<dyn ShareRootsReconciler>,
     /// The blob store upload pulls fetch from and exports publish into.
     pub blobs: Arc<dyn BlobTransferPort>,
     /// The progress back-channel byte counts are reported over, keyed by the
@@ -64,6 +70,7 @@ pub struct RemoteShareServe {
     store: Arc<dyn SharedRootStorePort>,
     authorizer: ShareAuthorizer,
     confinement: Arc<dyn ShareConfinementPort>,
+    reconciler: Arc<dyn ShareRootsReconciler>,
     /// Staging sessions, fetch workers, progress aggregation, and export
     /// leases — the transfer mechanics behind the admitted verbs.
     transfers: ShareTransferCoordinator,
@@ -74,6 +81,7 @@ impl RemoteShareServe {
         let RemoteShareServeDeps {
             share_store,
             confinement,
+            reconciler,
             blobs,
             progress,
         } = deps;
@@ -82,6 +90,7 @@ impl RemoteShareServe {
             authorizer: ShareAuthorizer::new(share_store),
             transfers: ShareTransferCoordinator::new(confinement.clone(), blobs, progress),
             confinement,
+            reconciler,
         }
     }
 
@@ -95,6 +104,15 @@ impl RemoteShareServe {
     ) -> Result<(), ShareServeError> {
         if self.authorizer.authorize(peer, root, op).await.is_none() {
             return Err(ShareServeError::NotAuthorized);
+        }
+        // The doc permits the op, but the registration set may have missed the
+        // root: the startup reconcile can run before the store is readable
+        // (daemon boots ahead of unlock), and single-root register failures
+        // also leave the root out. Ask the registration owner to re-converge —
+        // debounced inside; a still-missing root then hits the usual
+        // `RootGone` at resolve time, keeping the deny path fail-closed.
+        if !self.confinement.is_registered(root).await {
+            self.reconciler.reconcile_if_stale().await;
         }
         Ok(())
     }
@@ -530,6 +548,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Read;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use bytes::Bytes;
@@ -541,6 +560,8 @@ mod tests {
         ConfinedTrashPage, ShareGrants, ShareRoot, ShareStagedEntry, ShareStoreDoc,
         SharedRootStoreError,
     };
+
+    use crate::remote_share::registry::ShareRootsRegistry;
 
     /// A `SharedRootStorePort` backed by an in-memory doc or a forced failure.
     enum StoreState {
@@ -623,6 +644,10 @@ mod tests {
         root_id: ShareRootId,
         root_path: PathBuf,
         behavior: Mutex<ConfineBehavior>,
+        /// Whether the root made it into the registration set. `register_root`
+        /// flips it on, `unregister_root` off; an unregistered root resolves to
+        /// `RootGone`, mirroring the real confinement's registration check.
+        registered: AtomicBool,
         /// trash_id → (original_rel, is_dir). Trash meta lives in memory; the stub is
         /// a test double, not a persistent implementation.
         trash: Mutex<HashMap<String, (String, bool)>>,
@@ -634,6 +659,7 @@ mod tests {
                 root_id,
                 root_path,
                 behavior: Mutex::new(ConfineBehavior::Resolve),
+                registered: AtomicBool::new(true),
                 trash: Mutex::new(HashMap::new()),
             })
         }
@@ -693,18 +719,21 @@ mod tests {
             _root: ShareRootId,
             _path: &Path,
         ) -> Result<(), ConfineError> {
+            self.registered.store(true, Ordering::Relaxed);
             Ok(())
         }
-        async fn unregister_root(&self, _root: ShareRootId) {}
+        async fn unregister_root(&self, _root: ShareRootId) {
+            self.registered.store(false, Ordering::Relaxed);
+        }
         async fn is_registered(&self, root: ShareRootId) -> bool {
-            root == self.root_id
+            root == self.root_id && self.registered.load(Ordering::Relaxed)
         }
         async fn resolve(
             &self,
             root: ShareRootId,
             client_rel: &str,
         ) -> Result<ConfinedTarget, ConfineError> {
-            if root != self.root_id {
+            if !self.is_registered(root).await {
                 return Err(ConfineError::RootGone);
             }
             self.gate()?;
@@ -718,7 +747,7 @@ mod tests {
             ))
         }
         async fn resolve_root(&self, root: ShareRootId) -> Result<ConfinedTarget, ConfineError> {
-            if root != self.root_id {
+            if !self.is_registered(root).await {
                 return Err(ConfineError::RootGone);
             }
             self.gate()?;
@@ -1210,6 +1239,27 @@ mod tests {
         }
     }
 
+    /// A `ShareRootsReconciler` that counts heal requests; production wiring
+    /// substitutes the real `ShareRootsRegistry`.
+    struct StubReconciler {
+        calls: AtomicUsize,
+    }
+
+    impl StubReconciler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ShareRootsReconciler for StubReconciler {
+        async fn reconcile_if_stale(&self) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// A fresh transfer id plus the UUID-string key progress frames carry.
     fn transfer_id() -> (ShareTransferId, String) {
         let id = uuid::Uuid::new_v4();
@@ -1274,6 +1324,7 @@ mod tests {
         let handler = RemoteShareServe::new(RemoteShareServeDeps {
             share_store: store,
             confinement: confinement.clone(),
+            reconciler: StubReconciler::new(),
             blobs,
             progress,
         });
@@ -1305,6 +1356,7 @@ mod tests {
         let handler = RemoteShareServe::new(RemoteShareServeDeps {
             share_store: store,
             confinement: conf,
+            reconciler: StubReconciler::new(),
             blobs: StubBlobs::serving(b""),
             progress: StubProgress::new(),
         });
@@ -1317,6 +1369,7 @@ mod tests {
         let handler = RemoteShareServe::new(RemoteShareServeDeps {
             share_store: store,
             confinement: conf,
+            reconciler: StubReconciler::new(),
             blobs: StubBlobs::serving(b""),
             progress: StubProgress::new(),
         });
@@ -1348,6 +1401,7 @@ mod tests {
         let handler = RemoteShareServe::new(RemoteShareServeDeps {
             share_store: store,
             confinement: conf,
+            reconciler: StubReconciler::new(),
             blobs: StubBlobs::serving(b""),
             progress: StubProgress::new(),
         });
@@ -1362,6 +1416,7 @@ mod tests {
         let handler = RemoteShareServe::new(RemoteShareServeDeps {
             share_store: store,
             confinement: conf,
+            reconciler: StubReconciler::new(),
             blobs: StubBlobs::serving(b""),
             progress: StubProgress::new(),
         });
@@ -1369,6 +1424,83 @@ mod tests {
             handler.list_roots(&peer()).await,
             Err(ShareServeError::NotUnlocked)
         ));
+    }
+
+    /// Boot-before-unlock regression: the startup reconcile ran while the store
+    /// was unreadable, so a doc-enabled root never reached the registration set
+    /// and every verb would fail `RootGone` until the next doc rewrite. The
+    /// first authorized verb must heal the registration through the reconciler
+    /// — the same op then proceeds against the now-registered root.
+    #[tokio::test]
+    async fn authorized_op_heals_missing_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("healed.txt"), b"x").unwrap();
+
+        let root_id = ShareRootId(uuid::Uuid::new_v4());
+        let mut doc = ShareStoreDoc::new();
+        doc.roots.push(ShareRoot {
+            id: root_id,
+            path: tmp.path().to_string_lossy().into_owned(),
+            label: "docs".to_owned(),
+            grants: read_only_grants(),
+            enabled: true,
+            added_at_ms: 0,
+        });
+        let store = StubStore::with(doc);
+        let conf = StubConfinement::with(root_id, tmp.path().to_path_buf());
+        // Registration set never converged — as if startup ran while locked.
+        conf.registered.store(false, Ordering::Relaxed);
+        // Production wiring: the real registration owner as the reconciler.
+        let reconciler = Arc::new(ShareRootsRegistry::new(store.clone(), conf.clone()));
+        let handler = RemoteShareServe::new(RemoteShareServeDeps {
+            share_store: store,
+            confinement: conf.clone(),
+            reconciler,
+            blobs: StubBlobs::serving(b""),
+            progress: StubProgress::new(),
+        });
+
+        let page = handler.list(&peer(), root_id, "", None, 100).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(conf.is_registered(root_id).await);
+    }
+
+    /// The heal path is debounced inside the reconciler: a root that stays
+    /// unregistered (e.g. its path is gone for good) must not re-run a full
+    /// convergence on every denied verb. The counting stub observes exactly
+    /// one heal request per authorized verb — and the op still fails closed.
+    #[tokio::test]
+    async fn authorized_op_on_gone_root_still_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_id = ShareRootId(uuid::Uuid::new_v4());
+        let mut doc = ShareStoreDoc::new();
+        doc.roots.push(ShareRoot {
+            id: root_id,
+            path: tmp.path().to_string_lossy().into_owned(),
+            label: "docs".to_owned(),
+            grants: read_only_grants(),
+            enabled: true,
+            added_at_ms: 0,
+        });
+        let store = StubStore::with(doc);
+        let conf = StubConfinement::with(root_id, tmp.path().to_path_buf());
+        conf.registered.store(false, Ordering::Relaxed);
+        let reconciler = StubReconciler::new();
+        let handler = RemoteShareServe::new(RemoteShareServeDeps {
+            share_store: store,
+            confinement: conf.clone(),
+            reconciler: reconciler.clone(),
+            blobs: StubBlobs::serving(b""),
+            progress: StubProgress::new(),
+        });
+
+        // The stub reconciler cannot actually register: the op still denies as
+        // `RootGone`, but the heal request reached the registration owner.
+        assert!(matches!(
+            handler.list(&peer(), root_id, "", None, 100).await,
+            Err(ShareServeError::RootGone)
+        ));
+        assert_eq!(reconciler.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1461,6 +1593,7 @@ mod tests {
         let handler = RemoteShareServe::new(RemoteShareServeDeps {
             share_store: store,
             confinement: conf,
+            reconciler: StubReconciler::new(),
             blobs: StubBlobs::serving(b""),
             progress: StubProgress::new(),
         });
