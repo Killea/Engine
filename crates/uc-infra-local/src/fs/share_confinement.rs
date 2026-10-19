@@ -614,6 +614,17 @@ fn open_staging_dir(root_dir: &Dir, staging_id: &str) -> Result<Option<Dir>, Con
     }
 }
 
+/// `ConfinedTarget.relative` 是宿主 `PathBuf`；回收元数据里的 `original_rel`
+/// 属于线面契约，必须回到 `/` 分段的线文法——Windows 上 `to_string_lossy`
+/// 会落成 `\` 分段，回喂给 restore 的 `to` 时过不了文法筛查。
+fn wire_rel_of(relative: &Path) -> String {
+    relative
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// 丢弃一个暂存目录；不存在视为已丢弃（幂等）。
 fn remove_staging_tree(root_dir: &Dir, staging_id: &str) -> Result<(), ConfineError> {
     match root_dir.remove_dir_all(staging_dir_name(staging_id)) {
@@ -1005,7 +1016,7 @@ impl ShareConfinementPort for CapStdConfinement {
         write_trash_meta(
             &entry_dir,
             &TrashMeta {
-                original_rel: target.relative.to_string_lossy().into_owned(),
+                original_rel: wire_rel_of(&target.relative),
                 deleted_at_ms: now_ms(),
                 is_dir,
                 size_bytes,
@@ -1064,7 +1075,9 @@ impl ShareConfinementPort for CapStdConfinement {
             };
             entries.push(ConfinedTrashEntry {
                 trash_id: trash_id.clone(),
-                original_rel: meta.original_rel,
+                // 旧版 Windows 持有方曾以宿主分隔符写 `original_rel`；
+                // MAIN_SEPARATOR 归一只在 Windows 上生效，不影响合法 `\` 名。
+                original_rel: meta.original_rel.replace(std::path::MAIN_SEPARATOR, "/"),
                 deleted_at_ms: meta.deleted_at_ms,
                 is_dir: meta.is_dir,
                 size_bytes: meta.size_bytes,
@@ -1208,10 +1221,6 @@ impl ShareConfinementPort for CapStdConfinement {
         };
 
         let result = self.commit_entries(&staging_dir, &dest_dir, entries, policy);
-        // 落位用完才放句：cap-std 在 Windows 上以无 FILE_SHARE_DELETE 打开目录
-        // （dir_utils.rs 的设计决策），持着 `staging_dir` 调 RemoveDirectory
-        // 必然 ACCESS_DENIED，会留下空残留目录。
-        drop(staging_dir);
         // 规格 §8.1：落位成功或失败都丢弃暂存目录（失败不留半成品）。清理失败
         // 不翻转已完成的结果：重试仍失败时记入待重试表，下一个同根 staging
         // 动词惰性补扫，登记扫描仍是最后兜底。
@@ -1416,6 +1425,14 @@ mod tests {
     // 行为级探针在 `tests/share_confinement_escape_probe.rs`；
     // 这里只留纯函数的最小断言。
     use super::*;
+
+    #[test]
+    fn wire_rel_of_joins_components_with_forward_slashes() {
+        // `original_rel` 属于线面契约，任何宿主上都必须 `/` 分段。
+        let rel: PathBuf = ["a", "b", "c.txt"].iter().collect();
+        assert_eq!(wire_rel_of(&rel), "a/b/c.txt");
+        assert_eq!(wire_rel_of(Path::new("")), "");
+    }
 
     #[test]
     fn split_rel_splits_last_component() {
