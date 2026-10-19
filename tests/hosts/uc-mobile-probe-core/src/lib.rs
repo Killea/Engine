@@ -2000,6 +2000,7 @@ mod tests {
                 pairing_state: "trusted".into(),
                 channel: uc_engine::PeerConnectionChannelSummary::Relay,
                 connection_address: Some("private active address".into()),
+                connection_local_address: Some("private local address".into()),
             },
         ]));
         let mut settings = uc_engine::SettingsSummary::default();
